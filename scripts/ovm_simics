@@ -1,0 +1,249 @@
+#!/bin/bash
+set -e
+
+# Find relative paths
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "$BIN_DIR" == *"output_"* ]]; then
+    OUT_DIR="$(cd "$BIN_DIR/.." && pwd)"
+    PROJECT_ROOT="$(cd "$OUT_DIR/.." && pwd)"
+else
+    PROJECT_ROOT="$(cd "$BIN_DIR/.." && pwd)"
+    TARGET_ARCH="${ARCH:-$(uname -m)}"
+    if [ "$TARGET_ARCH" = "aarch64" ] || [ "$TARGET_ARCH" = "arm64" ]; then
+        OUT_DIR="$PROJECT_ROOT/output_arm64"
+    else
+        OUT_DIR="$PROJECT_ROOT/output_x86_64"
+    fi
+fi
+SIMICS_DIR="$PROJECT_ROOT/simics"
+SIMICS_BIN="$SIMICS_DIR/simics"
+
+if [ ! -x "$SIMICS_BIN" ]; then
+    echo "Error: Simics binary not found at $SIMICS_BIN." >&2
+    exit 1
+fi
+
+if [[ "$OUT_DIR" == *"arm64"* ]]; then
+    SSH_PORT="${SSH_PORT:-2225}"
+    KERNEL="$OUT_DIR/linux_host/arch/arm64/boot/Image"
+else
+    SSH_PORT="${SSH_PORT:-2224}"
+    KERNEL="$OUT_DIR/linux_host/arch/x86/boot/bzImage"
+fi
+
+SIMICS_TARGET="qsp-x86/user-provided-linux"
+
+GUEST_TYPE="ovm_guest"
+HOST_CPUS="${HOST_CPUS:-2}"
+HOST_MEM="${HOST_MEM:-4G}"
+GUEST_CPUS=""
+GUEST_MEM=""
+
+parse_memory_megs() {
+    local mem="$1"
+    if [[ "$mem" =~ ^([0-9]+)[gG]$ ]]; then
+        echo $((${BASH_REMATCH[1]} * 1024))
+    elif [[ "$mem" =~ ^([0-9]+)[mM]?$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+    else
+        echo "4096"
+    fi
+}
+
+show_usage() {
+    echo "Usage: $0 [ovm_guest|ovm_guest_qemu|none] [OPTIONS]"
+    echo ""
+    echo "Host Options:"
+    echo "  -C, --host-cpus CPUS       Number of host vCPUs (default: 2)"
+    echo "  -M, --host-memory MEM      Host RAM size (default: 4G)"
+    echo ""
+    echo "Guest Options:"
+    echo "  ovm_guest                  Start guest VM using NanoVMM (default)"
+    echo "  ovm_guest_qemu             Start guest VM using QEMU"
+    echo "  none                       Do not start any guest VM"
+    echo "  -c, --guest-cpus N         Number of CPUs for guest VM (default: 1)"
+    echo "  -m, --guest-memory MEM     Guest RAM size (default: 128M)"
+    echo "  --gdb                      Enable GDB remote stub (default port: 1234)"
+    echo "  --gdb-port PORT            Specify GDB remote stub port (default: 1234)"
+    echo "  -h, --help                 Show this help message"
+}
+
+GUEST_ORPHAN=""
+GDB_ENABLED=false
+GDB_PORT="1234"
+NOKASLR=false
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        ovm_guest|ovm_guest_qemu|none)
+            GUEST_TYPE="$1"
+            shift
+            ;;
+        --guest=*)
+            GUEST_TYPE="${1#*=}"
+            shift
+            ;;
+        --guest)
+            GUEST_TYPE="$2"
+            shift 2
+            ;;
+        --gdb|-g)
+            GDB_ENABLED=true
+            shift
+            ;;
+        --gdb-port)
+            GDB_PORT="$2"
+            GDB_ENABLED=true
+            shift 2
+            ;;
+        --nokaslr)
+            NOKASLR=true
+            shift
+            ;;
+        -C|--host-cpus)
+            HOST_CPUS="$2"
+            shift 2
+            ;;
+        -M|--host-memory)
+            HOST_MEM="$2"
+            shift 2
+            ;;
+        -c|--guest-cpus)
+            GUEST_CPUS="$2"
+            shift 2
+            ;;
+        -m|--guest-memory)
+            GUEST_MEM="$2"
+            shift 2
+            ;;
+        -k|--extra-cmdline)
+            EXTRA_CMDLINE="$2"
+            shift 2
+            ;;
+        --kernel)
+            CUSTOM_KERNEL="$2"
+            shift 2
+            ;;
+        --kernel=*)
+            CUSTOM_KERNEL="${1#*=}"
+            shift
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        *)
+            echo "Error: Unknown argument '$1'" >&2
+            show_usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [ -n "$CUSTOM_KERNEL" ]; then
+    KERNEL="$(realpath "$CUSTOM_KERNEL")"
+elif [ -n "$OVM_KERNEL" ]; then
+    KERNEL="$(realpath "$OVM_KERNEL")"
+fi
+
+if [ -z "$KERNEL" ] || [ ! -f "$KERNEL" ]; then
+    echo "Error: Host kernel not found at $KERNEL. Please build it first using 'make linux-host'." >&2
+    exit 1
+fi
+
+ROOTFS_EXT4="$OUT_DIR/buildroot_host/images/rootfs.ext4"
+if [ ! -f "$ROOTFS_EXT4" ]; then
+    echo "Error: Host ext4 rootfs not found at $ROOTFS_EXT4. Please build it first using 'make buildroot-host'." >&2
+    exit 1
+fi
+
+case "$GUEST_TYPE" in
+    ovm_guest|ovm_guest_qemu|none)
+        ;;
+    *)
+        echo "Error: Invalid guest type '$GUEST_TYPE'. Valid options: ovm_guest, ovm_guest_qemu, none" >&2
+        exit 1
+        ;;
+esac
+
+CMDLINE_EXTRA="ovm_guest=$GUEST_TYPE"
+if [ -n "$GUEST_CPUS" ]; then
+    CMDLINE_EXTRA="$CMDLINE_EXTRA ovm_guest_cpus=$GUEST_CPUS"
+fi
+if [ -n "$GUEST_MEM" ]; then
+    CMDLINE_EXTRA="$CMDLINE_EXTRA ovm_guest_mem=$GUEST_MEM"
+fi
+if [ -n "$EXTRA_CMDLINE" ]; then
+    CMDLINE_EXTRA="$CMDLINE_EXTRA $EXTRA_CMDLINE"
+fi
+
+HOST_MEM_MEGS="$(parse_memory_megs "$HOST_MEM")"
+
+VMP_FLAGS=()
+if [ "$GDB_ENABLED" != "true" ] && ([ -c /dev/vmx ] || [ -e /dev/vmx ]); then
+    echo "Simics VMP hardware acceleration (/dev/vmx) detected: enabling VMP."
+    VMP_FLAGS=(-e "enable-vmp")
+fi
+
+GDB_FLAGS=()
+if [ "$GDB_ENABLED" = "true" ]; then
+    echo "GDB remote stub enabled on port $GDB_PORT. Connect with: gdb $KERNEL -ex 'target extended-remote :$GDB_PORT'"
+    cpus_list="["
+    for ((i=0; i<HOST_CPUS; i++)); do
+        if [ $i -gt 0 ]; then cpus_list="$cpus_list, "; fi
+        cpus_list="${cpus_list}qsp.mb.cpu0.core[${i}][0]"
+    done
+    cpus_list="${cpus_list}]"
+    GDB_FLAGS=(-e "new-gdb-remote port = $GDB_PORT cpus = $cpus_list")
+fi
+if [ "$NOKASLR" = "true" ]; then
+    CMDLINE_EXTRA="$CMDLINE_EXTRA nokaslr"
+fi
+
+VM_ROOTFS="/tmp/ovm_simics_rootfs_${SSH_PORT}.ext4"
+cp --reflink=auto "$ROOTFS_EXT4" "$VM_ROOTFS"
+trap "rm -f '$VM_ROOTFS'" EXIT INT TERM
+
+echo "Starting Simics with Virtio Block RootFS ($HOST_CPUS CPUs, $HOST_MEM RAM, SSH port $SSH_PORT, guest=$GUEST_TYPE)..."
+cd "$SIMICS_DIR"
+
+echo "Once started, connect to the serial console via: telnet localhost 4000"
+if [ "$GDB_ENABLED" = "true" ]; then
+    ./simics --batch-mode --no-win "$SIMICS_TARGET" \
+        machine:software:linux:kernel="$KERNEL" \
+        machine:software:linux:virtio_rootfs="$VM_ROOTFS" \
+        machine:software:linux:cmdline="root=/dev/vda rw console=ttyS0 panic=1 liveupdate=on kvm.caretaker_enabled=1 kvm.report_ignored_msrs=0 raid=noautodetect earlyprintk=ttyS0,115200 mitigations=off nowatchdog rcupdate.rcu_expedited=1 tsc=reliable clocksource=tsc no_timer_check i8042.noaux=1 i8042.nokbd=1 iomem=relaxed $CMDLINE_EXTRA" \
+        machine:hardware:processor:class="x86QSP3" \
+        machine:hardware:processor:num_cores="$HOST_CPUS" \
+        machine:hardware:memory_megs="$HOST_MEM_MEGS" \
+        machine:hardware:consoles:con0:show=false \
+        machine:hardware:consoles:gfx_con:show=false \
+        machine:hardware:consoles:gfx_con:create=false \
+        "${VMP_FLAGS[@]}" \
+        "${GDB_FLAGS[@]}" \
+        -e 'qsp.serconsole.con.enable-cmd-line-output' \
+        -e 'qsp.serconsole.con.telnet-setup 4000' \
+        -e 'connect-real-network-napt ethernet_switch' \
+        -e "connect-real-network-port-in 22 ethernet_switch host-port = ${SSH_PORT} target-ip = \"10.10.0.100\"" \
+        -e "run-python-file $PROJECT_ROOT/scripts/simics_monitor.py" \
+        -e 'run'
+else
+    ./simics --batch-mode --no-win "$SIMICS_TARGET" \
+        machine:software:linux:kernel="$KERNEL" \
+        machine:software:linux:virtio_rootfs="$VM_ROOTFS" \
+        machine:software:linux:cmdline="root=/dev/vda rw console=ttyS0 panic=1 liveupdate=on kvm.caretaker_enabled=1 kvm.report_ignored_msrs=0 raid=noautodetect earlyprintk=ttyS0,115200 mitigations=off nowatchdog rcupdate.rcu_expedited=1 tsc=reliable clocksource=tsc no_timer_check i8042.noaux=1 i8042.nokbd=1 iomem=relaxed $CMDLINE_EXTRA" \
+        machine:hardware:processor:class="x86QSP3" \
+        machine:hardware:processor:num_cores="$HOST_CPUS" \
+        machine:hardware:memory_megs="$HOST_MEM_MEGS" \
+        machine:hardware:consoles:con0:show=false \
+        machine:hardware:consoles:gfx_con:show=false \
+        machine:hardware:consoles:gfx_con:create=false \
+        "${VMP_FLAGS[@]}" \
+        "${GDB_FLAGS[@]}" \
+        -e 'qsp.serconsole.con.enable-cmd-line-output' \
+        -e 'qsp.serconsole.con.telnet-setup 4000' \
+        -e 'connect-real-network-napt ethernet_switch' \
+        -e "connect-real-network-port-in 22 ethernet_switch host-port = ${SSH_PORT} target-ip = \"10.10.0.100\"" \
+        -e "run-python-file $PROJECT_ROOT/scripts/simics_monitor.py" \
+        -e 'run'
+fi

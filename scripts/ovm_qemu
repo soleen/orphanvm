@@ -1,0 +1,278 @@
+#!/bin/bash
+set -e
+
+# Find relative paths
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "$BIN_DIR" == *"output_"* ]]; then
+    OUT_DIR="$(cd "$BIN_DIR/.." && pwd)"
+else
+    PROJECT_ROOT="$(cd "$BIN_DIR/.." && pwd)"
+    TARGET_ARCH="${ARCH:-$(uname -m)}"
+    if [ "$TARGET_ARCH" = "aarch64" ] || [ "$TARGET_ARCH" = "arm64" ]; then
+        OUT_DIR="$PROJECT_ROOT/output_arm64"
+    else
+        OUT_DIR="$PROJECT_ROOT/output_x86_64"
+    fi
+fi
+
+TARGET_PLATFORM="${OVM_PLATFORM:-amd}"
+GUEST_TYPE="ovm_guest"
+HOST_CPUS="${HOST_CPUS:-2}"
+HOST_MEM="${HOST_MEM:-4G}"
+GUEST_CPUS=""
+GUEST_MEM=""
+
+show_usage() {
+    echo "Usage: $0 [ovm_guest|ovm_guest_qemu|none] [OPTIONS]"
+    echo ""
+    echo "Host Options:"
+    echo "  -t, --target TARGET        Target platform: amd (default) or intel (QEMU+KVM)"
+    echo "  -C, --host-cpus CPUS       Number of host vCPUs (default: 2)"
+    echo "  -M, --host-memory MEM      Host RAM size (default: 4G)"
+    echo ""
+    echo "Guest Options:"
+    echo "  ovm_guest                  Start guest VM using NanoVMM (default)"
+    echo "  ovm_guest_qemu             Start guest VM using QEMU"
+    echo "  none                       Do not start any guest VM"
+    echo "  -c, --guest-cpus N         Number of CPUs for guest VM (default: 1)"
+    echo "  -m, --guest-memory MEM     Guest RAM size (default: 128M)"
+    echo "  --demo-disk DISK           Attach extra demo disk image (virtio /dev/vdc)"
+    echo "  -k, --extra-cmdline CMDLINE Extra kernel command line arguments"
+    echo "  -h, --help                 Show this help message"
+}
+
+GDB_ENABLED=false
+GDB_PORT="1234"
+NOKASLR=false
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        ovm_guest|ovm_guest_qemu|none)
+            GUEST_TYPE="$1"
+            shift
+            ;;
+        --guest=*)
+            GUEST_TYPE="${1#*=}"
+            shift
+            ;;
+        --guest)
+            GUEST_TYPE="$2"
+            shift 2
+            ;;
+        -t|--target)
+            TARGET_PLATFORM="$2"
+            shift 2
+            ;;
+        -t=*|--target=*)
+            TARGET_PLATFORM="${1#*=}"
+            shift
+            ;;
+        --gdb|-g)
+            GDB_ENABLED=true
+            shift
+            ;;
+        --gdb-port)
+            GDB_PORT="$2"
+            GDB_ENABLED=true
+            shift 2
+            ;;
+        --nokaslr)
+            NOKASLR=true
+            shift
+            ;;
+        -C|--host-cpus)
+            HOST_CPUS="$2"
+            shift 2
+            ;;
+        -M|--host-memory)
+            HOST_MEM="$2"
+            shift 2
+            ;;
+        -c|--guest-cpus)
+            GUEST_CPUS="$2"
+            shift 2
+            ;;
+        -m|--guest-memory)
+            GUEST_MEM="$2"
+            shift 2
+            ;;
+        -k|--extra-cmdline)
+            EXTRA_CMDLINE="$2"
+            shift 2
+            ;;
+        --kernel)
+            CUSTOM_KERNEL="$2"
+            shift 2
+            ;;
+        --kernel=*)
+            CUSTOM_KERNEL="${1#*=}"
+            shift
+            ;;
+        --demo-disk)
+            DEMO_DISK="$2"
+            shift 2
+            ;;
+        --demo-disk=*)
+            DEMO_DISK="${1#*=}"
+            shift
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        *)
+            echo "Error: Unknown argument '$1'" >&2
+            show_usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Architecture and platform detection
+if [[ "$OUT_DIR" == *"arm64"* ]]; then
+    TARGET_PLATFORM="arm"
+    QEMU_BIN="qemu-system-aarch64"
+    QEMU_OPTS="-machine virt,virtualization=on,gic-version=3,memory-backend=host-mem -cpu max -accel tcg,tb-size=512,thread=multi -rtc base=utc,clock=host -vga none -display none"
+    CONSOLE="ttyAMA0"
+    SSH_PORT="${SSH_PORT:-2223}"
+    KERNEL="$OUT_DIR/linux_host/arch/arm64/boot/Image"
+    FAST_BOOT_OPTS="earlycon=pl011,0x09000000 ignore_loglevel mitigations=off nowatchdog rcupdate.rcu_expedited=1 udev.children-max=2 net.ifnames=0 biosdevname=0"
+elif [ "$TARGET_PLATFORM" = "intel" ]; then
+    if [ "$(uname -m)" != "x86_64" ] || ! grep -qi "GenuineIntel" /proc/cpuinfo 2>/dev/null; then
+        echo "Error: 'intel' target requires an Intel x86_64 host processor." >&2
+        exit 1
+    fi
+    if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+        echo "Error: 'intel' target requires read/write access to /dev/kvm." >&2
+        exit 1
+    fi
+    if [ ! -f /sys/module/kvm_intel/parameters/nested ]; then
+        modprobe kvm_intel 2>/dev/null || true
+    fi
+    if [ ! -f /sys/module/kvm_intel/parameters/nested ] || ! grep -qi "^[y1]" /sys/module/kvm_intel/parameters/nested 2>/dev/null; then
+        echo "Error: 'intel' target requires nested virtualization enabled (kvm_intel.nested=Y)." >&2
+        exit 1
+    fi
+    QEMU_BIN="qemu-system-x86_64"
+    QEMU_OPTS="-machine q35,memory-backend=host-mem -cpu host -accel kvm -rtc base=utc,clock=host -vga none -display none"
+    CONSOLE="ttyS0"
+    SSH_PORT="${SSH_PORT:-2225}"
+    KERNEL="$OUT_DIR/linux_host/arch/x86/boot/bzImage"
+    FAST_BOOT_OPTS="earlyprintk=ttyS0,115200 ignore_loglevel mitigations=off nowatchdog rcupdate.rcu_expedited=1 tsc=reliable clocksource=tsc no_timer_check i8042.noaux=1 i8042.nokbd=1 iomem=relaxed lpj=5200000 udev.children-max=2"
+else
+    TARGET_PLATFORM="amd"
+    QEMU_BIN="qemu-system-x86_64"
+    QEMU_OPTS="-machine q35,memory-backend=host-mem -cpu max,vendor=AuthenticAMD,family=26,model=1,model-id=AMD-EPYC-Turin,svm=on -accel tcg,tb-size=512,thread=multi -rtc base=utc,clock=host -vga none -display none -device intel-iommu,intremap=on,eim=on"
+    CONSOLE="ttyS0"
+    SSH_PORT="${SSH_PORT:-2222}"
+    KERNEL="$OUT_DIR/linux_host/arch/x86/boot/bzImage"
+    FAST_BOOT_OPTS="earlyprintk=ttyS0,115200 ignore_loglevel mitigations=off nowatchdog rcupdate.rcu_expedited=1 tsc=reliable clocksource=tsc no_timer_check i8042.noaux=1 i8042.nokbd=1 iomem=relaxed lpj=5200000 udev.children-max=2"
+fi
+
+if [ -n "$CUSTOM_KERNEL" ]; then
+    KERNEL="$CUSTOM_KERNEL"
+elif [ -n "$OVM_KERNEL" ]; then
+    KERNEL="$OVM_KERNEL"
+fi
+
+if ! command -v "$QEMU_BIN" >/dev/null 2>&1; then
+    echo "Error: $QEMU_BIN is not installed." >&2
+    exit 1
+fi
+
+if [ -z "$KERNEL" ] || [ ! -f "$KERNEL" ]; then
+    echo "Error: Host kernel not found at $KERNEL. Please build it first using 'make linux-host'." >&2
+    exit 1
+fi
+
+ROOTFS_EXT4="$OUT_DIR/buildroot_host/images/rootfs.ext4"
+if [ ! -f "$ROOTFS_EXT4" ]; then
+    echo "Error: Host ext4 rootfs not found at $ROOTFS_EXT4. Please build it first using 'make buildroot-host'." >&2
+    exit 1
+fi
+
+case "$GUEST_TYPE" in
+    ovm_guest|ovm_guest_qemu|none)
+        ;;
+    *)
+        echo "Error: Invalid guest type '$GUEST_TYPE'. Valid options: ovm_guest, ovm_guest_qemu, none" >&2
+        exit 1
+        ;;
+esac
+
+CMDLINE_EXTRA="ovm_guest=$GUEST_TYPE"
+if [ -n "$GUEST_CPUS" ]; then
+    CMDLINE_EXTRA="$CMDLINE_EXTRA ovm_guest_cpus=$GUEST_CPUS"
+fi
+if [ -n "$GUEST_MEM" ]; then
+    CMDLINE_EXTRA="$CMDLINE_EXTRA ovm_guest_mem=$GUEST_MEM"
+fi
+if [ -n "$EXTRA_CMDLINE" ]; then
+    CMDLINE_EXTRA="$CMDLINE_EXTRA $EXTRA_CMDLINE"
+fi
+
+PLATFORM_SUFFIX="${TARGET_PLATFORM:-${OVM_PLATFORM:-amd}}"
+if [ -f "$OUT_DIR/kernel_disk_${PLATFORM_SUFFIX}.ext4" ]; then
+    KERNEL_DISK="$OUT_DIR/kernel_disk_${PLATFORM_SUFFIX}.ext4"
+else
+    KERNEL_DISK="$OUT_DIR/kernel_disk.ext4"
+fi
+EXTRA_DRIVES=""
+if [ -f "$KERNEL_DISK" ]; then
+    EXTRA_DRIVES="-drive file=$KERNEL_DISK,format=raw,if=virtio,cache=none"
+fi
+if [ -n "$DEMO_DISK" ] && [ -f "$DEMO_DISK" ]; then
+    EXTRA_DRIVES="$EXTRA_DRIVES -drive file=$DEMO_DISK,format=raw,if=virtio,cache=none"
+fi
+
+if [ $((SSH_PORT % 2)) -eq 0 ]; then
+    SHM_MEM_PATH="${SHM_MEM_PATH:-/tmp/ovm_host_mem_${SSH_PORT}}"
+else
+    SHM_MEM_PATH="${SHM_MEM_PATH:-/dev/shm/ovm_host_mem_${SSH_PORT}}"
+fi
+rm -f "$SHM_MEM_PATH"
+trap 'rm -f "$SHM_MEM_PATH" "/tmp/ovm_host_mem_${SSH_PORT}" "/dev/shm/ovm_host_mem_${SSH_PORT}" 2>/dev/null || true' EXIT INT TERM
+MEM_BACKEND_OPTS="-object memory-backend-file,id=host-mem,size=$HOST_MEM,mem-path=$SHM_MEM_PATH,share=on"
+HMP_SOCK="/tmp/qemu_hmp_${SSH_PORT}.sock"
+QMP_SOCK="/tmp/qemu_qmp_${SSH_PORT}.sock"
+GDB_OPTS=""
+if [ "$GDB_ENABLED" = "true" ]; then
+    echo "GDB remote stub enabled on port $GDB_PORT. Connect with: gdb $KERNEL -ex 'target remote :$GDB_PORT'"
+    GDB_OPTS="-gdb tcp::$GDB_PORT"
+fi
+if [ "$NOKASLR" = "true" ]; then
+    CMDLINE_EXTRA="$CMDLINE_EXTRA nokaslr"
+fi
+
+TRACE_OPTS=""
+if [ "$QEMU_TRACE" = "true" ] || [ -n "$QEMU_TRACE_PATTERN" ]; then
+    PATTERN="${QEMU_TRACE_PATTERN:-gicv3_icc_generate_sgi,enable=gicv3_redist_send_sgi,enable=gicv3_cpuif_set_irqs,enable=gicv3_redist_set_irq}"
+    TRACE_LOG="/tmp/qemu_trace_${SSH_PORT}.log"
+    rm -f "$TRACE_LOG"
+    TRACE_OPTS="-trace enable=${PATTERN},file=${TRACE_LOG}"
+    echo "QEMU tracing enabled pattern '$PATTERN' -> $TRACE_LOG"
+fi
+
+DEBUG_OPTS=""
+if [ "$QEMU_DEBUG" = "true" ] || [ -n "$QEMU_DEBUG_ITEMS" ]; then
+    ITEMS="${QEMU_DEBUG_ITEMS:-int,guest_errors,unimp}"
+    DEBUG_LOG="/tmp/qemu_debug_${SSH_PORT}.log"
+    rm -f "$DEBUG_LOG"
+    DEBUG_OPTS="-d ${ITEMS} -D ${DEBUG_LOG}"
+    echo "QEMU exception debugging enabled -> $DEBUG_LOG"
+fi
+
+DRIVE_OPTS="-drive file=$ROOTFS_EXT4,format=raw,if=virtio,snapshot=on"
+ROOT_DEV="/dev/vda"
+
+echo "Starting QEMU with RootFS (nokvm, $HOST_CPUS CPUs, $HOST_MEM RAM, SSH port $SSH_PORT, guest=$GUEST_TYPE, shm=$SHM_MEM_PATH)..."
+"$QEMU_BIN" $MEM_BACKEND_OPTS $QEMU_OPTS $MONITOR_OPTS $GDB_OPTS $TRACE_OPTS $DEBUG_OPTS $QEMU_EXTRA_OPTS \
+    -m "$HOST_MEM" -smp "$HOST_CPUS" \
+    -kernel "$KERNEL" \
+    $DRIVE_OPTS \
+    $EXTRA_DRIVES \
+    -netdev user,id=net0,hostfwd=tcp::${SSH_PORT}-:22 \
+    -device virtio-net-pci,netdev=net0,romfile= \
+    -append "root=$ROOT_DEV rw console=$CONSOLE panic=0 liveupdate=on kvm.caretaker_enabled=1 kvm.report_ignored_msrs=0 kvm_intel.dump_invalid_vmcs=1 raid=noautodetect $FAST_BOOT_OPTS $CMDLINE_EXTRA" \
+    $([ "$GDB_ENABLED" = "true" ] && echo "-no-reboot -no-shutdown" || echo "-no-reboot") \
+    -nographic

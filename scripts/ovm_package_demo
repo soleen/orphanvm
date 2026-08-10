@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""
+Package Demo Guest Rootfs for OrphanVM LLaMA Conference Demo.
+"""
+
+import argparse
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Package OrphanVM Demo Guest Rootfs containing LLaMA 1B and custom prompt.",
+    )
+    parser.add_argument("-b", "--base", default=None, help="Base rootfs.cpio or rootfs.cpio.lz4")
+    parser.add_argument("-m", "--model", default=None, help="Path to GGUF model file")
+    parser.add_argument("-l", "--llama", default=None, help="Path to ovm_llama static binary")
+    parser.add_argument("-p", "--prompt", default=None, help="Inference prompt text")
+    parser.add_argument("-P", "--prompt-file", default=None, help="Path to text file containing prompt")
+    parser.add_argument("-o", "--output", default=None, help="Output demo rootfs.cpio.lz4 path")
+    parser.add_argument("-a", "--arch", default=None, help="Target architecture (arm64, x86_64)")
+
+    args = parser.parse_args()
+
+    project_root = Path(__file__).resolve().parent.parent
+    if project_root.name.startswith("output_"):
+        project_root = project_root.parent
+
+    arch = args.arch or os.environ.get("ARCH") or ("arm64" if os.uname().machine in ("aarch64", "arm64") else "x86_64")
+    out_dir = project_root / ("output_arm64" if arch in ("arm64", "aarch64") else "output_x86_64")
+
+    # Resolve base rootfs
+    base_path = Path(args.base) if args.base else None
+    if not base_path:
+        cand1 = out_dir / "buildroot_guest" / "images" / "rootfs.cpio"
+        cand2 = out_dir / "buildroot_guest" / "images" / "rootfs.cpio.lz4"
+        if cand1.is_file():
+            base_path = cand1
+        elif cand2.is_file():
+            base_path = cand2
+        else:
+            print(f"Error: Base guest rootfs not found in {out_dir}. Run 'make buildroot-guest' first.", file=sys.stderr)
+            return 1
+
+    # Resolve model
+    model_path = Path(args.model) if args.model else project_root / "assets" / "models" / "Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+    if not model_path.is_file():
+        print(f"Error: Model file not found at {model_path}.", file=sys.stderr)
+        return 1
+
+    # Resolve ovm_llama
+    llama_path = Path(args.llama) if args.llama else out_dir / "bin" / "ovm_llama"
+    if not llama_path.is_file():
+        # Check /tmp/llama_cpp_build
+        cand = Path("/tmp/llama_cpp_build/build/bin/llama-completion")
+        if cand.is_file():
+            llama_path = cand
+        else:
+            print(f"Error: ovm_llama binary not found at {llama_path}. Run 'scripts/ovm_build_llama' first.", file=sys.stderr)
+            return 1
+
+    out_file = Path(args.output) if args.output else out_dir / "demo_guest_rootfs.cpio.lz4"
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Resolve prompt
+    prompt_text = (
+        "Write an exhaustive, highly detailed technical treatise covering the complete architecture "
+        "and principles of operating system live kernel updates, hypervisor memory management, hardware "
+        "virtualization extensions, CPU context preservation, MMU page table migration, and lockless "
+        "inter-kernel handoffs in depth, providing clear structured explanations for each concept."
+    )
+    if args.prompt_file and Path(args.prompt_file).is_file():
+        prompt_text = Path(args.prompt_file).read_text(encoding="utf-8").strip()
+    elif args.prompt:
+        prompt_text = args.prompt.strip()
+
+    t0 = time.time()
+    print("=== Packaging OrphanVM Demo Guest Rootfs ===")
+    print(f"Base rootfs: {base_path}")
+    print(f"Model:       {model_path} ({model_path.stat().st_size / (1024*1024):.1f} MB)")
+    print(f"Binary:      {llama_path}")
+    print(f"Output:      {out_file}")
+
+    # Use out_dir as scratch so hardlinks work across same filesystem
+    scratch_parent = out_dir if out_dir.is_dir() else project_root
+    with tempfile.TemporaryDirectory(dir=str(scratch_parent)) as td:
+        tmp_cpio = Path(td) / "combined.cpio"
+        stage = Path(td) / "stage"
+        (stage / "usr" / "bin").mkdir(parents=True, exist_ok=True)
+        (stage / "etc" / "init.d").mkdir(parents=True, exist_ok=True)
+        (stage / "opt" / "models").mkdir(parents=True, exist_ok=True)
+
+        # 1. Base CPIO extraction/copy
+        if base_path.suffix == ".lz4":
+            subprocess.run(["lz4", "-dc", str(base_path)], stdout=open(tmp_cpio, "wb"), check=True)
+        else:
+            shutil.copyfile(base_path, tmp_cpio)
+
+        # 2. Stage new files
+        dest_bin = stage / "usr" / "bin" / "ovm_llama"
+        try:
+            os.link(str(llama_path), str(dest_bin))
+        except OSError:
+            shutil.copyfile(llama_path, dest_bin)
+        dest_bin.chmod(0o755)
+
+        dest_model = stage / "opt" / "models" / "model.gguf"
+        try:
+            os.link(str(model_path), str(dest_model))
+        except OSError:
+            shutil.copyfile(model_path, dest_model)
+        (stage / "opt").chmod(0o755)
+        (stage / "opt" / "models").chmod(0o755)
+        dest_model.chmod(0o644)
+
+        workload_src = project_root / "overlays" / "buildroot_guest" / "usr" / "bin" / "ovm_llama_workload"
+        dest_workload = stage / "usr" / "bin" / "ovm_llama_workload"
+        if workload_src.is_file():
+            shutil.copyfile(workload_src, dest_workload)
+        else:
+            dest_workload.write_text("#!/bin/sh\nexec /usr/bin/ovm_llama -m /opt/models/model.gguf -p \"$(cat /etc/ovm_llama_prompt.txt)\" -n 32768 -t 4 -c 4096 --simple-io -no-cnv --ignore-eos --context-shift\n")
+        dest_workload.chmod(0o755)
+
+        s99_src = project_root / "overlays" / "buildroot_guest" / "etc" / "init.d" / "S99ovm_agent"
+        dest_s99 = stage / "etc" / "init.d" / "S99ovm_agent"
+        if s99_src.is_file():
+            shutil.copyfile(s99_src, dest_s99)
+            dest_s99.chmod(0o755)
+
+        (stage / "etc" / "ovm_llama_prompt.txt").write_text(prompt_text + "\n", encoding="utf-8")
+
+        # 3. Append staged files and directories to CPIO
+        flist = []
+        for root_dir, dirs, files in os.walk(stage):
+            for d in dirs:
+                rel = os.path.relpath(os.path.join(root_dir, d), stage)
+                flist.append(rel)
+            for f in files:
+                rel = os.path.relpath(os.path.join(root_dir, f), stage)
+                flist.append(rel)
+        flist.sort()
+
+        p = subprocess.Popen(
+            ["cpio", "-H", "newc", "-o", "-A", "-F", str(tmp_cpio)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=str(stage),
+        )
+        p.communicate("\n".join(flist).encode("utf-8") + b"\n")
+        if p.returncode != 0:
+            print(f"Error: cpio append failed with return code {p.returncode}", file=sys.stderr)
+            return 1
+
+        # 4. Compress with lz4 -l -1
+        subprocess.run(
+            ["lz4", "-l", "-1", "-f", str(tmp_cpio), str(out_file)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+
+    dur = time.time() - t0
+    sz_mb = out_file.stat().st_size / (1024 * 1024)
+    print(f"[PASS] Successfully generated demo rootfs in {dur:.2f}s: {out_file} ({sz_mb:.1f} MB)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

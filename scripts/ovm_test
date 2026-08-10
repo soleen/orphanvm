@@ -1,0 +1,1364 @@
+#!/usr/bin/env python3
+"""
+OrphanVM Unified Test Suite (Python Edition)
+
+Comprehensive test runner performing single-configuration tests and the full
+multi-architecture test matrix with intra-kernel cancel loops and host kexec
+live updates with on-core vCPU preservation.
+"""
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+import datetime
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from typing import Dict, List, Optional, Tuple
+
+# Terminal color codes
+COLOR_RED = "\033[0;31m"
+COLOR_GREEN = "\033[0;32m"
+COLOR_YELLOW = "\033[0;33m"
+COLOR_BLUE = "\033[0;34m"
+COLOR_CYAN = "\033[0;36m"
+COLOR_BOLD = "\033[1m"
+COLOR_RESET = "\033[0m"
+
+TEST_LOG_FILE: Optional[Path] = None
+VERBOSE_MODE: bool = False
+LOG_LOCK = threading.Lock()
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+def _extract_target(clean_msg: str) -> Optional[str]:
+    m = re.match(r"^\[([a-zA-Z0-9_-]+)\]", clean_msg.strip())
+    return m.group(1) if m else None
+
+def log_to_file(msg: str, target: Optional[str] = None) -> None:
+    if TEST_LOG_FILE:
+        try:
+            with LOG_LOCK:
+                with open(TEST_LOG_FILE, "a", encoding="utf-8") as f:
+                    f.write(msg + "\n")
+                matrix_log = TEST_LOG_FILE.parent / "matrix.log"
+                if matrix_log.exists() and TEST_LOG_FILE != matrix_log:
+                    with open(matrix_log, "a", encoding="utf-8") as f:
+                        f.write(msg + "\n")
+                if target:
+                    tgt_log = TEST_LOG_FILE.parent / f"test_{target}.log"
+                    with open(tgt_log, "a", encoding="utf-8") as f:
+                        f.write(msg + "\n")
+        except Exception:
+            pass
+
+def log_info(msg: str) -> None:
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    clean = ANSI_ESCAPE_RE.sub("", msg)
+    tgt = _extract_target(clean)
+    log_to_file(f"[{ts}] [INFO] {clean}", target=tgt)
+    if VERBOSE_MODE:
+        print(f"[{ts}] {COLOR_BLUE}[INFO]{COLOR_RESET} {msg}", flush=True)
+
+def log_pass(msg: str) -> None:
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    clean = ANSI_ESCAPE_RE.sub("", msg)
+    tgt = _extract_target(clean)
+    log_to_file(f"[{ts}] [PASS] {clean}", target=tgt)
+    if VERBOSE_MODE:
+        print(f"[{ts}] {COLOR_GREEN}[PASS]{COLOR_RESET} {msg}", flush=True)
+
+def log_fail(msg: str) -> None:
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    clean = ANSI_ESCAPE_RE.sub("", msg)
+    tgt = _extract_target(clean)
+    log_to_file(f"[{ts}] [FAIL] {clean}", target=tgt)
+    if VERBOSE_MODE:
+        print(f"[{ts}] {COLOR_RED}[FAIL]{COLOR_RESET} {msg}", flush=True)
+
+def log_warn(msg: str) -> None:
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    clean = ANSI_ESCAPE_RE.sub("", msg)
+    tgt = _extract_target(clean)
+    log_to_file(f"[{ts}] [WARN] {clean}", target=tgt)
+    if VERBOSE_MODE:
+        print(f"[{ts}] {COLOR_YELLOW}[WARN]{COLOR_RESET} {msg}", flush=True)
+
+def log_step(msg: str) -> None:
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    clean = ANSI_ESCAPE_RE.sub("", msg)
+    tgt = _extract_target(clean)
+    log_to_file(f"\n[{ts}] === {clean} ===\n", target=tgt)
+    if VERBOSE_MODE:
+        print(f"\n[{ts}] {COLOR_BOLD}=== {msg} ==={COLOR_RESET}\n", flush=True)
+
+
+@dataclass
+class TargetInfo:
+    name: str
+    arch: str
+    env_arg: str
+    ssh_port: int
+    gdb_port: int
+    desc: str
+
+TARGETS: Dict[str, TargetInfo] = {
+    "arm": TargetInfo("arm", "arm64", "arm", 2223, 1237, "QEMU aarch64 (TCG / Cortex-A57)"),
+    "amd": TargetInfo("amd", "x86_64", "amd", 2222, 1234, "QEMU x86_64 (AMD SVM TCG)"),
+    "intel": TargetInfo("intel", "x86_64", "intel", 2225, 1236, "QEMU x86_64 (Intel VMX KVM)"),
+    "simics": TargetInfo("simics", "x86_64", "simics", 2224, 1235, "Simics x86_64 (Intel Xeon)"),
+}
+
+
+@dataclass
+class TestResult:
+    target: str
+    boot_status: str = "FAIL"
+    boot_time_sec: Optional[float] = None
+    kexec_status: str = "N/A"
+    kexec_time_sec: Optional[float] = None
+    cancel_completed: int = 0
+    total_cancel: int = 0
+    kexec_completed: int = 0
+    total_kexec: int = 0
+    baseline_rate: str = "N/A"
+    orphan_rate: str = "N/A"
+    ingap_rate: str = "N/A"
+    resumed_rate: str = "N/A"
+    overall_status: str = "FAIL"
+    duration_sec: float = 0.0
+    progress_lines: List[str] = field(default_factory=list)
+    telemetry_lines: List[str] = field(default_factory=list)
+
+
+def find_system_binary(name: str) -> str:
+    """Resolve system binary preferring /usr/bin and /bin over user wrappers."""
+    for path in (f"/usr/bin/{name}", f"/bin/{name}"):
+        if os.path.exists(path) and os.access(path, os.X_OK):
+            return path
+    return shutil.which(name) or name
+
+
+class SSHClient:
+    """Robust, timeout-guarded SSH execution client."""
+    def __init__(self, port: int, host: str = "127.0.0.1", user: str = "root"):
+        self.port = port
+        self.host = host
+        self.user = user
+
+    def run(self, cmd: str, timeout: int = 30, retries: int = 3) -> Tuple[int, str, str]:
+        connect_timeout = min(timeout, 10)
+        ssh_bin = find_system_binary("ssh")
+        ssh_cmd = [
+            ssh_bin,
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "LogLevel=ERROR",
+            "-o", f"ConnectTimeout={connect_timeout}",
+            "-p", str(self.port),
+            f"{self.user}@{self.host}",
+            cmd,
+        ]
+        last_rc = 255
+        last_out = ""
+        last_err = ""
+        for attempt in range(retries + 1):
+            try:
+                p = subprocess.run(
+                    ssh_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=timeout,
+                )
+                last_rc = p.returncode
+                last_out = p.stdout.strip()
+                last_err = p.stderr.strip()
+                # OpenSSH exits 255 on network/connection failure.
+                # Retry if transient connection failure and attempts remain.
+                if last_rc == 255 and attempt < retries:
+                    time.sleep(1)
+                    continue
+                return last_rc, last_out, last_err
+            except subprocess.TimeoutExpired:
+                return 124, "", "SSH command timed out"
+            except Exception as e:
+                return 1, "", str(e)
+        return last_rc, last_out, last_err
+
+    def is_alive(self, timeout: int = 5) -> bool:
+        rc, out, _ = self.run("echo ready", timeout=timeout, retries=0)
+        return rc == 0 and "ready" in out
+
+
+class TargetRunner:
+    """Manages a single target execution (boot, cancel loops, kexec loops)."""
+    def __init__(self, target_info: TargetInfo, args: argparse.Namespace, project_root: Path, log_dir: Path):
+        self.tinfo = target_info
+        self.args = args
+        self.root = project_root
+        self.log_dir = log_dir
+        self.target = target_info.name
+        self.ssh = SSHClient(target_info.ssh_port)
+        self.vm_proc: Optional[subprocess.Popen] = None
+        self.vm_log_path = log_dir / f"vm_{self.target}.log"
+        self.test_log_path = log_dir / f"test_{self.target}.log"
+        self.result = TestResult(target=self.target)
+        self.agent_offsets: Dict[int, str] = {}
+        self.off_csv = ""
+        self.stop_event = threading.Event()
+        self.fatal_detected: Optional[str] = None
+        self.preserved_pcpus: List[int] = []
+        self.preserves_pcpus = False
+        self.expected_orphan_online = ""
+        self.expected_restored_online = ""
+        self.llama_hpa: Optional[str] = None
+        self.demo_disk_path: Optional[Path] = None
+        self.guest_initrd: Optional[str] = None
+
+    def _parse_suspend_cpu_pool(self) -> None:
+        """Parse suspend CPU pool configuration into preserved pCPUs and FIFO token."""
+        pool = self.args.suspend
+        host_cpus = self.args.host_cpus
+        guest_cpus = self.args.guest_cpus
+
+        # Default (no -S): auto-detect symmetric CPU pool (cpu1-N)
+        if pool is None:
+            pres_end = min(guest_cpus, host_cpus - 1)
+            if pres_end > 1:
+                self.fifo_pool = f"cpu1-{pres_end}"
+            elif pres_end == 1:
+                self.fifo_pool = "cpu1"
+            else:
+                self.fifo_pool = ""
+        elif pool == "":
+            # Suspend without CPU pool: vCPU only (RAM)
+            self.fifo_pool = ""
+        else:
+            # Suspend with explicit CPU pool
+            self.fifo_pool = pool
+
+        self.preserved_pcpus = []
+        if self.fifo_pool:
+            tokens = [t.strip() for t in self.fifo_pool.split(",")]
+            for tok in tokens:
+                m = re.match(r"^cpu(\d+)(?:-(\d+))?$", tok)
+                if m:
+                    start = int(m.group(1))
+                    end = int(m.group(2)) if m.group(2) else start
+                    for p in range(start, end + 1):
+                        if 0 <= p < host_cpus:
+                            self.preserved_pcpus.append(p)
+            self.preserved_pcpus = sorted(list(set(self.preserved_pcpus)))
+
+        self.preserves_pcpus = len(self.preserved_pcpus) > 0
+
+        # Calculate expected online CPU string
+        all_pcpus = set(range(host_cpus))
+        orphan_pcpus = sorted(list(all_pcpus - set(self.preserved_pcpus)))
+        self.expected_orphan_online = self._format_cpulist(orphan_pcpus)
+        self.expected_restored_online = self._format_cpulist(sorted(list(all_pcpus)))
+
+    @staticmethod
+    def _format_cpulist(cpus: List[int]) -> str:
+        """Convert list of CPU IDs to standard kernel cpulist string (e.g. 0,2-3)."""
+        if not cpus:
+            return ""
+        ranges = []
+        start = cpus[0]
+        end = start
+        for c in cpus[1:]:
+            if c == end + 1:
+                end = c
+            else:
+                ranges.append(f"{start}-{end}" if start != end else f"{start}")
+                start = end = c
+        ranges.append(f"{start}-{end}" if start != end else f"{start}")
+        return ",".join(ranges)
+
+    def _tail_console(self) -> None:
+        """Background thread tailing console log for panics and faults."""
+        fatal_regex = re.compile(r"Triple fault|Kernel panic|Fatal exception|error\] Access", re.IGNORECASE)
+        ansi_regex = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+        try:
+            with open(self.vm_log_path, "r", encoding="utf-8", errors="replace") as f:
+                while not self.stop_event.is_set():
+                    line = f.readline()
+                    if line:
+                        clean_line = ansi_regex.sub("", line)
+                        if fatal_regex.search(clean_line):
+                            self.fatal_detected = clean_line.strip()
+                            log_fail(f"[{self.target}] FATAL CPU fault or kernel panic: {self.fatal_detected}")
+                            break
+                    else:
+                        time.sleep(0.1)
+        except Exception:
+            pass
+
+    def stop_vm(self) -> None:
+        """Terminate host VM process group and clean up ports."""
+        self.stop_event.set()
+        if self.vm_proc and self.vm_proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(self.vm_proc.pid), signal.SIGTERM)
+                self.vm_proc.wait(timeout=3)
+            except Exception:
+                try:
+                    os.killpg(os.getpgid(self.vm_proc.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+        # Kill lingering QEMU / Simics processes on this target port
+        subprocess.run(f"pkill -9 -f 'qemu-system.*{self.tinfo.ssh_port}' 2>/dev/null", shell=True)
+        if self.target == "simics":
+            subprocess.run("pkill -9 -f 'simics-common' 2>/dev/null", shell=True)
+            subprocess.run("fuser -k 4000/tcp 2>/dev/null", shell=True)
+        subprocess.run(f"fuser -k {self.tinfo.ssh_port}/tcp 2>/dev/null", shell=True)
+        subprocess.run(f"rm -f /tmp/ovm_host_mem_{self.tinfo.ssh_port} /dev/shm/ovm_host_mem_{self.tinfo.ssh_port} 2>/dev/null", shell=True)
+        for _ in range(20):
+            res = subprocess.run(f"pgrep -f 'qemu-system.*{self.tinfo.ssh_port}' >/dev/null", shell=True)
+            if res.returncode != 0:
+                break
+            time.sleep(0.1)
+
+    def _prepare_llama_env(self) -> bool:
+        models_dir = self.root / "assets" / "models"
+        models_dir.mkdir(parents=True, exist_ok=True)
+        model_path = Path(self.args.model) if getattr(self.args, "model", None) else models_dir / "Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+        if not model_path.is_file():
+            if getattr(self.args, "offline", False):
+                log_fail(f"[{self.target}] Model not found at {model_path} and --offline requested.")
+                return False
+            log_info(f"[{self.target}] Downloading LLaMA 1B model...")
+            cmd = ["curl", "-L", "-o", str(model_path), "--progress-bar", "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"]
+            subprocess.run(cmd, check=True)
+
+        out_arch = f"output_{self.tinfo.arch}"
+        llama_bin = self.root / out_arch / "bin" / "ovm_llama"
+        if not llama_bin.is_file():
+            cand = Path("/tmp/llama_cpp_build/build/bin/llama-completion")
+            if cand.is_file():
+                llama_bin.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(cand, llama_bin)
+                llama_bin.chmod(0o755)
+            else:
+                log_info(f"[{self.target}] Compiling ovm_llama binary...")
+                subprocess.run([str(self.root / "scripts" / "ovm_build_llama")], check=True)
+
+        demo_rootfs = self.root / out_arch / "demo_guest_rootfs.cpio.lz4"
+        pkg_script = self.root / "scripts" / "ovm_package_demo"
+        subprocess.run([
+            sys.executable, str(pkg_script),
+            "-m", str(model_path),
+            "-l", str(llama_bin),
+            "-o", str(demo_rootfs),
+            "-a", self.tinfo.arch,
+        ], check=True)
+
+        self.demo_disk_path = self.root / out_arch / "demo_disk.ext4"
+        sz_mb = int(demo_rootfs.stat().st_size / (1024 * 1024)) + 50
+        subprocess.run(["truncate", "-s", f"{sz_mb}M", str(self.demo_disk_path)], check=True)
+        subprocess.run(["mkfs.ext4", "-F", "-q", "-L", "demo", str(self.demo_disk_path)], check=True)
+        subprocess.run(
+            ["debugfs", "-w", "-R", f"write {demo_rootfs} demo_rootfs.cpio.lz4", str(self.demo_disk_path)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+        )
+        return True
+
+    def launch_vm(self) -> bool:
+        """Launch host VM in background."""
+        self.stop_vm()
+        time.sleep(0.5)
+        self.stop_event.clear()
+        self.fatal_detected = None
+
+        vm_opts = f"-C {self.args.host_cpus} -M {self.args.host_memory} -c {self.args.guest_cpus} -m {self.args.guest_memory}"
+        if getattr(self.args, "llama", False):
+            self._prepare_llama_env()
+            if self.demo_disk_path and self.demo_disk_path.is_file():
+                vm_opts += f" --demo-disk '{self.demo_disk_path}'"
+            vm_opts += " none"
+        elif getattr(self.args, "ipi", False):
+            vm_opts += " --extra-cmdline ovm_guest_extra=ovm_ipi"
+        if getattr(self.args, "kernel", None):
+            vm_opts += f" --kernel {Path(self.args.kernel).resolve()}"
+        if self.args.gdb:
+            vm_opts += f" --gdb --gdb-port {self.tinfo.gdb_port}"
+            target_cmd = "target extended-remote" if self.target == "simics" else "target remote"
+            log_info(f"[{self.target}] GDB remote stub active on port {self.tinfo.gdb_port}. Connect: gdb output_{self.tinfo.arch}/linux_host/vmlinux -ex '{target_cmd} :{self.tinfo.gdb_port}'")
+
+        launcher = "ovm_simics" if self.target == "simics" else "ovm_qemu"
+        cmd = f"cd '{self.root}' && source env.sh '{self.tinfo.env_arg}' && {launcher} {vm_opts}"
+
+        log_info(f"[{self.target}] Launching host VM: {cmd}")
+        vm_log = open(self.vm_log_path, "w", encoding="utf-8")
+        self.vm_proc = subprocess.Popen(
+            ["bash", "-c", cmd],
+            stdin=subprocess.DEVNULL,
+            stdout=vm_log,
+            stderr=subprocess.STDOUT,
+            preexec_fn=os.setsid,
+            text=True,
+        )
+
+        threading.Thread(target=self._tail_console, daemon=True).start()
+        return True
+
+    def wait_for_boot(self, timeout: int) -> bool:
+        """Poll SSH until host VM boots successfully."""
+        log_info(f"[{self.target}] Waiting for host VM SSH on port {self.tinfo.ssh_port} (timeout: {timeout}s)...")
+        start_ts = time.time()
+        while time.time() - start_ts < timeout:
+            if self.fatal_detected:
+                return False
+            if self.vm_proc and self.vm_proc.poll() is not None:
+                log_fail(f"[{self.target}] Host VM process exited unexpectedly with code {self.vm_proc.returncode}")
+                return False
+            if self.ssh.is_alive(timeout=min(self.args.hang_timeout, 20)):
+                dur = time.time() - start_ts
+                self.result.boot_status = "PASS"
+                self.result.boot_time_sec = round(dur, 2)
+                log_pass(f"[{self.target}] Host VM booted successfully in {self.result.boot_time_sec}s")
+                if getattr(self.args, "llama", False):
+                    self.ssh.run("mkdir -p /mnt/demo 2>/dev/null; mount -o ro -L demo /mnt/demo 2>/dev/null || mount -o ro /dev/disk/by-label/demo /mnt/demo 2>/dev/null || mount -o ro /dev/vdc /mnt/demo 2>/dev/null || true", timeout=10)
+                    self.guest_initrd = "/mnt/demo/demo_rootfs.cpio.lz4"
+                    rc, out, err = self.ssh.run(f"ovm_guest -c {self.args.guest_cpus} -m {self.args.guest_memory} -i {self.guest_initrd} -b /tmp", timeout=30)
+                    if rc != 0:
+                        log_fail(f"[{self.target}] Failed to launch LLaMA guest VM: {out} {err}")
+                        return False
+                return True
+            time.sleep(1)
+        log_fail(f"[{self.target}] Timed out waiting for host VM SSH ({timeout}s)")
+        return False
+
+    def discover_guest_agents(self, timeout: int) -> bool:
+        """Locate guest workload agent RAM offsets instantly via in-host wait."""
+        if getattr(self.args, "llama", False):
+            log_info(f"[{self.target}] Waiting for LLaMA inference engine to announce GPA (timeout: {timeout}s)...")
+            start_ts = time.time()
+            while time.time() - start_ts < timeout:
+                rc, out, _ = self.ssh.run("ovm_monitor -L 2>/dev/null", timeout=5)
+                if rc == 0 and out.strip().startswith("0x"):
+                    self.llama_hpa = out.strip()
+                    dur_ms = int((time.time() - start_ts) * 1000)
+                    log_pass(f"[{self.target}] Discovered LLaMA stream at host RAM offset {self.llama_hpa} in {dur_ms}ms")
+                    break
+                time.sleep(1)
+            else:
+                log_fail(f"[{self.target}] Timed out waiting for LLaMA stream announcement")
+                self._dump_diagnostics()
+                return False
+
+            log_info(f"[{self.target}] Waiting for LLaMA model load and first token generation...")
+            t_tok = time.time()
+            tok_timeout = 180 if self.target == "simics" else 120
+            while time.time() - t_tok < tok_timeout:
+                rc, out, _ = self.ssh.run(f"ovm_monitor -S {self.llama_hpa} 2>/dev/null", timeout=5)
+                if rc == 0 and "TOKENS" in out:
+                    m = re.search(r"TOKENS\s+(\d+)", out)
+                    if m and int(m.group(1)) > 0:
+                        log_pass(f"[{self.target}] LLaMA engine actively generating tokens ({m.group(1)} tokens)")
+                        return True
+                time.sleep(1)
+            log_fail(f"[{self.target}] Timed out waiting for token generation")
+            self._dump_diagnostics()
+            return False
+
+        log_info(f"[{self.target}] Waiting for guest workload agents to announce GPAs (timeout: {timeout}s)...")
+        start_ts = time.time()
+        target_cpus = self.args.guest_cpus
+
+        # Run host wait loop until ovm_monitor -F -a returns offsets for all target vCPUs
+        wait_cmd = (
+            f"for i in $(seq 1 {timeout * 2}); do "
+            f"  OUT=$(ovm_monitor -F -a 2>/dev/null || true); "
+            f"  LINES=$(echo \"$OUT\" | grep -c '^[0-9]' 2>/dev/null || true); "
+            f"  if [ \"$LINES\" -ge {target_cpus} ]; then "
+            f"    echo \"$OUT\"; "
+            f"    exit 0; "
+            f"  fi; "
+            f"  sleep 0.5; "
+            f"done; "
+            f"exit 1"
+        )
+        rc, out, _ = self.ssh.run(wait_cmd, timeout=timeout + 10)
+        if rc == 0 and out:
+            for line in out.splitlines():
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    try:
+                        cpu_id = int(parts[0])
+                        offset = parts[1]
+                        if cpu_id < target_cpus:
+                            self.agent_offsets[cpu_id] = offset
+                    except ValueError:
+                        continue
+
+        if len(self.agent_offsets) >= target_cpus:
+            self.off_csv = ",".join([self.agent_offsets[i] for i in range(target_cpus)])
+            dur_ms = int((time.time() - start_ts) * 1000)
+            log_pass(f"[{self.target}] Discovered all {target_cpus} guest workload agents in {dur_ms}ms (zero memory polling)")
+            for c, off in sorted(self.agent_offsets.items()):
+                log_pass(f"[{self.target}]   Guest vCPU {c} agent at RAM offset {off}")
+            return True
+
+        # Fallback polling in case host wait exited early or transient network error
+        while time.time() - start_ts < timeout:
+            rc, out, _ = self.ssh.run("ovm_monitor -F -a 2>/dev/null", timeout=5)
+            if rc == 0 and out:
+                for line in out.splitlines():
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        try:
+                            cpu_id = int(parts[0])
+                            offset = parts[1]
+                            if cpu_id < target_cpus:
+                                self.agent_offsets[cpu_id] = offset
+                        except ValueError:
+                            continue
+                if len(self.agent_offsets) >= target_cpus:
+                    self.off_csv = ",".join([self.agent_offsets[i] for i in range(target_cpus)])
+                    dur_ms = int((time.time() - start_ts) * 1000)
+                    log_pass(f"[{self.target}] Discovered all {target_cpus} guest workload agents in {dur_ms}ms (zero memory polling)")
+                    for c, off in sorted(self.agent_offsets.items()):
+                        log_pass(f"[{self.target}]   Guest vCPU {c} agent at RAM offset {off}")
+                    return True
+            time.sleep(1)
+
+        log_fail(f"[{self.target}] Timed out waiting for guest workload agents")
+        return False
+
+    def sample_progress(self) -> List[int]:
+        """Query current iteration counter for all guest vCPUs."""
+        if getattr(self.args, "llama", False):
+            if not self.llama_hpa:
+                return [-1] * self.args.guest_cpus
+            cmd_timeout = 20 if self.target in ("simics", "arm", "amd", "intel") else 5
+            for _ in range(5):
+                rc, out, _ = self.ssh.run(f"ovm_monitor -S {self.llama_hpa} 2>/dev/null", timeout=cmd_timeout)
+                if rc == 0 and "TOKENS" in out:
+                    m = re.search(r"TOKENS\s+(\d+)", out)
+                    if m:
+                        toks = int(m.group(1))
+                        return [toks] * self.args.guest_cpus
+                time.sleep(0.2)
+            return [-1] * self.args.guest_cpus
+
+        if not self.off_csv:
+            return [-1] * self.args.guest_cpus
+        cmd_timeout = 20 if self.target in ("simics", "arm", "amd", "intel") else 5
+        retries_cnt = 5 if self.target in ("simics", "arm", "amd", "intel") else 15
+        for _ in range(retries_cnt):
+            rc, out, _ = self.ssh.run(f"ovm_monitor -O {self.off_csv} 2>/dev/null", timeout=cmd_timeout)
+            if rc == 0 and out:
+                tokens = out.split()
+                if len(tokens) >= self.args.guest_cpus:
+                    try:
+                        return [int(tok, 16) for tok in tokens[:self.args.guest_cpus]]
+                    except ValueError:
+                        pass
+            time.sleep(0.2)
+        return [-1] * self.args.guest_cpus
+
+    def measure_rate(self, phase_name: str, duration: float) -> Tuple[float, str]:
+        """Measure progress rate (passes/sec or tokens/sec) across guest vCPUs."""
+        if getattr(self.args, "llama", False):
+            s1 = self.sample_progress()
+            time.sleep(duration)
+            s2 = self.sample_progress()
+            delta = (s2[0] - s1[0]) if (s1[0] >= 0 and s2[0] >= s1[0]) else 0
+            rate = round(delta / duration, 1) if duration > 0 else 0.0
+            summary = f"[LLaMA 1B: Tokens {s1[0]} -> {s2[0]} (+{delta}, {rate} tok/s)]"
+            log_info(f"[{self.target}] {phase_name} progress: {summary}")
+            return rate, summary
+
+        s1 = self.sample_progress()
+        time.sleep(duration)
+        s2 = self.sample_progress()
+
+        deltas = []
+        summary_parts = []
+        for g in range(self.args.guest_cpus):
+            v1, v2 = s1[g], s2[g]
+            delta = (v2 - v1) if (v1 >= 0 and v2 >= v1) else 0
+            deltas.append(delta)
+            rate = round(delta / duration, 1) if duration > 0 else 0.0
+            summary_parts.append(f"[vCPU {g}: {v1} -> {v2} (+{delta}, {rate} p/s)]")
+
+        total_delta = sum(deltas)
+        total_rate = round(total_delta / duration, 1) if duration > 0 else 0.0
+        summary = " ".join(summary_parts)
+        log_info(f"[{self.target}] {phase_name} progress: {summary}")
+        return total_rate, summary
+
+    def _dump_diagnostics(self) -> None:
+        _, nlog, _ = self.ssh.run("cat /tmp/nvmm.log 2>/dev/null", timeout=15)
+        if nlog and nlog.strip():
+            log_fail(f"[{self.target}] NanoVMM log:\n{nlog.strip()}")
+        _, dlog, _ = self.ssh.run("dmesg | tail -n 100", timeout=5)
+        if dlog and dlog.strip():
+            log_fail(f"[{self.target}] Host kernel dmesg:\n{dlog.strip()}")
+        _, tinfo, _ = self.ssh.run(
+            "pid=$(pidof nvmm 2>/dev/null); if [ -n \"$pid\" ]; then "
+            "ps -T -p $pid; "
+            "for t in /proc/$pid/task/*; do echo \"Task $t stack:\"; cat $t/stack 2>/dev/null; done; "
+            "fi; cat /proc/interrupts 2>/dev/null | head -n 30; "
+            "for d in /sys/devices/system/cpu/cpu*/caretaker_diag /sys/kernel/debug/kvm/*/vcpu*/caretaker_telemetry; do if [ -f \"$d\" ]; then echo \"=== $d ===\"; cat $d 2>/dev/null; fi; done",
+            timeout=5,
+        )
+        if tinfo and tinfo.strip():
+            log_fail(f"[{self.target}] Host diagnostics & thread stacks:\n{tinfo.strip()}")
+        if self.args.gdb:
+            gdb_bin = "gdb-multiarch" if (self.tinfo.arch == "arm64" and shutil.which("gdb-multiarch")) else "gdb"
+            vmlinux_path = f"output_{self.tinfo.arch}/linux_host/vmlinux"
+            if self.tinfo.arch == "arm64":
+                reg_cmd = "-ex 'monitor info registers -a' -ex 'thread apply all print $pc' -ex 'thread apply all print $sp' -ex 'thread apply all x/10gx $sp'"
+            else:
+                reg_cmd = "-ex 'thread apply all print $cr2' -ex 'thread apply all print $cr3' -ex 'thread apply all print $rip' -ex 'thread apply all x/10gx $rsp'"
+            gdb_cmd = f"{gdb_bin} --batch -ex 'file {vmlinux_path}' -ex 'target remote :{self.tinfo.gdb_port}' -ex 'info threads' -ex 'thread apply all bt 10' {reg_cmd}"
+            p = subprocess.run(gdb_cmd, shell=True, capture_output=True, text=True, timeout=10)
+            log_fail(f"[{self.target}] GDB Dump:\n{p.stdout}\n{p.stderr}")
+
+    def suspend_guest(self) -> bool:
+        """Send suspend command via NanoVMM control FIFO and wait for confirmation."""
+        cmd = f"suspend {self.fifo_pool}".strip()
+        log_info(f"[{self.target}] Preserving guest VM (sending '{cmd}' to NanoVMM)...")
+        cmd_timeout = 30 if self.target in ("simics", "arm", "amd", "intel") else 15
+        ssh_cmd = (
+            f"rm -f /tmp/nvmm_preserved 2>/dev/null; "
+            f"FIFO=$(ls /tmp/nvmm_*.fifo 2>/dev/null | head -n 1); "
+            f"if [ -n \"$FIFO\" ] && [ -p \"$FIFO\" ]; then echo '{cmd}' > \"$FIFO\"; "
+            f"else kill -SIGUSR2 $(pidof nvmm); fi; "
+            f"for i in $(seq 1 600); do [ -f /tmp/nvmm_preserved ] && exit 0; sleep 0.1 2>/dev/null || sleep 1; done; exit 1"
+        )
+        rc, out, err = self.ssh.run(ssh_cmd, timeout=65)
+        if rc != 0:
+            self._dump_diagnostics()
+            log_fail(f"[{self.target}] NanoVMM failed to transition to preserved state (rc={rc}, out='{out}', err='{err}')")
+            return False
+
+        # Verify host online CPU mask matches expectation
+        chk_cmd = (
+            f"for i in $(seq 1 200); do "
+            f"  cur=$(cat /sys/devices/system/cpu/online 2>/dev/null); "
+            f"  if [ \"$cur\" = \"{self.expected_orphan_online}\" ]; then echo \"$cur\"; exit 0; fi; "
+            f"  sleep 0.1 2>/dev/null || sleep 1; "
+            f"done; "
+            f"cat /sys/devices/system/cpu/online 2>/dev/null; exit 1"
+        )
+        rc, out, _ = self.ssh.run(chk_cmd, timeout=cmd_timeout, retries=1)
+        if rc == 0 and out.strip() == self.expected_orphan_online:
+            mode_str = f"Guest VM preserved on-core. Host online CPUs: {out.strip()}" if self.preserves_pcpus else f"Guest VM preserved in RAM. Host online CPUs: {out.strip()}"
+            log_pass(f"[{self.target}] {mode_str}")
+            return True
+
+        log_fail(f"[{self.target}] Online CPUs '{out.strip()}' did not match expected '{self.expected_orphan_online}'")
+        return False
+
+    def resume_guest_fifo(self) -> bool:
+        """Send resume command to NanoVMM control FIFO to cancel preservation."""
+        log_info(f"[{self.target}] Resuming NanoVMM via FIFO...")
+        cmd_timeout = 45 if self.target in ("simics", "arm", "amd", "intel") else 15
+        ssh_cmd = (
+            "rm -f /tmp/nvmm_preserved 2>/dev/null; "
+            "FIFO=$(ls /tmp/nvmm_*.fifo 2>/dev/null | head -n 1); "
+            "if [ -n \"$FIFO\" ] && [ -p \"$FIFO\" ]; then echo 'resume' > \"$FIFO\"; fi; "
+            "for i in $(seq 1 300); do "
+            f"  cur=$(cat /sys/devices/system/cpu/online 2>/dev/null); "
+            f"  if [ \"$cur\" = \"{self.expected_restored_online}\" ]; then echo \"$cur\"; exit 0; fi; "
+            "  sleep 0.1 2>/dev/null || sleep 1; "
+            "done; "
+            "cat /sys/devices/system/cpu/online 2>/dev/null; exit 1"
+        )
+        rc, out, err = self.ssh.run(ssh_cmd, timeout=cmd_timeout, retries=2)
+        if rc == 0 and out.strip() == self.expected_restored_online:
+            log_pass(f"[{self.target}] Host physical CPUs successfully restored: {out.strip()}")
+            return True
+
+        self._dump_diagnostics()
+        log_fail(f"[{self.target}] Failed to restore physical CPUs online (got '{out.strip()}', expected '{self.expected_restored_online}')")
+        return False
+
+    def run_cancel_loops(self, count: int, prefix: str = "") -> bool:
+        """Execute N intra-kernel preservation start & cancel loops."""
+        for cycle in range(1, count + 1):
+            log_step(f"[{self.target}] --- {prefix}Cancel Cycle {cycle} / {count} ---")
+            if not self.suspend_guest():
+                return False
+
+            unit = "tok/s" if getattr(self.args, "llama", False) else "p/s"
+            if self.preserves_pcpus:
+                recheck_start = time.time()
+                recheck_timeout = 5 if self.args.gdb else max(30 if self.target in ("simics", "arm", "amd", "intel") else 15, int(self.args.duration) * 2 + 15)
+                rate = 0.0
+                while time.time() - recheck_start < recheck_timeout:
+                    rate, _ = self.measure_rate("Orphan Preserved", self.args.duration)
+                    if rate > 0:
+                        break
+                    time.sleep(0.5)
+                if rate <= 0:
+                    self._dump_diagnostics()
+                    log_fail(f"[{self.target}] Preserved vCPUs stalled (0 {unit})")
+                    return False
+                self.result.orphan_rate = f"{rate} {unit}"
+            else:
+                s1 = self.sample_progress()
+                time.sleep(self.args.duration)
+                s2 = self.sample_progress()
+                log_pass(f"[{self.target}] Guest preserved in RAM: vCPUs paused in memory (0 {unit})")
+                self.result.orphan_rate = f"0 {unit} (RAM)"
+
+            if not self.resume_guest_fifo():
+                return False
+
+            recheck_start = time.time()
+            recheck_timeout = max(30 if self.target in ("simics", "arm", "amd", "intel") else 15, int(self.args.duration) * 2 + 15)
+            rate = 0.0
+            while time.time() - recheck_start < recheck_timeout:
+                rate, _ = self.measure_rate("Resumed", self.args.duration)
+                if rate > 0:
+                    break
+                time.sleep(0.5)
+            if rate <= 0:
+                self._dump_diagnostics()
+                log_fail(f"[{self.target}] Resumed guest VM stalled")
+                return False
+            self.result.resumed_rate = f"{rate} {unit}"
+            self.result.cancel_completed += 1
+
+        return True
+
+    def run_kexec_loops(self, count: int) -> bool:
+        """Execute M kexec live update loops with guest vCPU preservation."""
+        for loop in range(1, count + 1):
+            log_step(f"[{self.target}] --- Starting Kexec Live Update Loop {loop} / {count} ---")
+
+            # 1. Intra-kernel cancel cycle prior to kexec
+            if self.args.cancel_loops > 0:
+                if not self.run_cancel_loops(self.args.cancel_loops, prefix=f"[Kexec {loop}/{count}] "):
+                    return False
+
+            # 2. Sample pre-kexec baseline
+            pre_kexec_rate, _ = self.measure_rate("Pre-Kexec Baseline", self.args.duration)
+            s_pre_kexec = self.sample_progress()
+
+            # 3. Suspend guest VM
+            if not self.suspend_guest():
+                return False
+
+            # 4. Stage and trigger host kexec
+            kernel_name = "Image" if self.tinfo.arch == "arm64" else "bzImage"
+            log_info(f"[{self.target}] Staging incoming kernel ({kernel_name}) via kexec -l...")
+            stage_cmd = (
+                "mkdir -p /mnt/boot 2>/dev/null; "
+                "mount -o ro /dev/vdb /mnt/boot 2>/dev/null || true; "
+                "kexec -u 2>/dev/null || true; "
+                "CMDLINE=$(cat /proc/cmdline 2>/dev/null | sed -E 's/ovm_guest[^ ]*//g' | sed -E 's/panic=[0-9]+/panic=0/g'); "
+                "CMDLINE=$(echo \"$CMDLINE ovm_guest=none panic=0 kvm_intel.dump_invalid_vmcs=1 systemd.crash_reboot=no systemd.show_status=1 systemd.log_target=console systemd.journald.forward_to_console=1 udev.children-max=2\" | tr ' ' '\\n' | awk 'NF && !seen[$0]++' | tr '\\n' ' '); "
+                f"kexec -s -l /mnt/boot/{kernel_name} --command-line=\"$CMDLINE\" || "
+                f"kexec -l /mnt/boot/{kernel_name} --command-line=\"$CMDLINE\" || "
+                f"kexec -s -l /boot/{kernel_name} --command-line=\"$CMDLINE\" || "
+                f"kexec -l /boot/{kernel_name} --command-line=\"$CMDLINE\"; "
+                "rc=$?; umount /mnt/boot 2>/dev/null || true; exit $rc"
+            )
+            rc, out, err = self.ssh.run(stage_cmd, timeout=30)
+            if rc != 0:
+                log_fail(f"[{self.target}] Failed to load kernel via kexec -l: {out} {err}")
+                return False
+            log_pass(f"[{self.target}] Kernel successfully loaded into host memory with preserved LUO session")
+
+            # Record pre-kexec boot_id to definitively distinguish old from new kernel
+            _, pre_boot_id, _ = self.ssh.run("cat /proc/sys/kernel/random/boot_id 2>/dev/null", timeout=5)
+            pre_boot_id = pre_boot_id.strip()
+
+            kexec_start_ts = time.time()
+            log_info(f"[{self.target}] Triggering host kexec -e...")
+            self.ssh.run("nohup sh -c 'sleep 0.2; sync; echo s > /proc/sysrq-trigger 2>/dev/null || true; echo u > /proc/sysrq-trigger 2>/dev/null || true; sleep 0.1; exec kexec -e' </dev/null >/dev/null 2>&1 &", timeout=5, retries=0)
+
+            # Wait for old kernel SSH to drop
+            log_info(f"[{self.target}] Waiting for old kernel to shut down...")
+            shutdown_start = time.time()
+            while time.time() - shutdown_start < 30:
+                if self.fatal_detected:
+                    return False
+                if not self.ssh.is_alive(timeout=1):
+                    break
+                time.sleep(0.5)
+
+            # Wait for host SSH to reconnect in incoming kernel with new boot_id
+            log_info(f"[{self.target}] Waiting for incoming kernel SSH (timeout: {self.args.kexec_timeout}s)...")
+            reconnected = False
+            while time.time() - kexec_start_ts < self.args.kexec_timeout:
+                if self.fatal_detected:
+                    return False
+                if self.vm_proc and self.vm_proc.poll() is not None:
+                    log_fail(f"[{self.target}] Host VM process exited unexpectedly with code {self.vm_proc.returncode}")
+                    return False
+                rc, cur_boot_id, _ = self.ssh.run("cat /proc/sys/kernel/random/boot_id 2>/dev/null", timeout=2, retries=0)
+                if rc == 0 and cur_boot_id:
+                    cur_id = cur_boot_id.strip()
+                    if not pre_boot_id or cur_id != pre_boot_id:
+                        reconnected = True
+                        break
+                time.sleep(1)
+
+            if not reconnected:
+                log_fail(f"[{self.target}] Host VM did not return after kexec within {self.args.kexec_timeout}s")
+                return False
+
+            kexec_dur = round(time.time() - kexec_start_ts, 2)
+            self.result.kexec_time_sec = kexec_dur
+            log_pass(f"[{self.target}] Host VM successfully rebooted into incoming kernel in {kexec_dur}s")
+
+            # 5. Verify preserved CPUs in incoming kernel
+            if self.preserves_pcpus:
+                rc, out, _ = self.ssh.run("cat /sys/devices/system/cpu/preserved 2>/dev/null", timeout=15)
+                log_pass(f"[{self.target}] Verified preserved physical CPUs in incoming kernel: preserved_cpus={out.strip()}")
+
+            # 6. Sample immediately post-kexec (in-gap progress)
+            s_post_kexec = self.sample_progress()
+            in_gap_deltas = []
+            for g in range(self.args.guest_cpus):
+                d = (s_post_kexec[g] - s_pre_kexec[g]) if (s_post_kexec[g] >= s_pre_kexec[g] and s_pre_kexec[g] >= 0) else 0
+                in_gap_deltas.append(d)
+            total_ingap = sum(in_gap_deltas)
+            ingap_rate = round(total_ingap / kexec_dur, 1)
+
+            unit = "tok/s" if getattr(self.args, "llama", False) else "p/s"
+            item = "tokens" if getattr(self.args, "llama", False) else "passes"
+            if self.preserves_pcpus:
+                log_pass(f"[{self.target}] In-gap on-core Caretaker progress: {total_ingap} {item} (~{ingap_rate} {unit}) during {kexec_dur}s kexec window")
+                self.result.ingap_rate = f"{ingap_rate} {unit}"
+            else:
+                log_pass(f"[{self.target}] In-gap RAM preservation verified (0 {unit} in kexec gap)")
+                self.result.ingap_rate = f"0 {unit} (RAM)"
+
+            # 7. Resume guest VM in incoming kernel
+            log_info(f"[{self.target}] Resuming NanoVMM in incoming kernel...")
+            self.ssh.run("rm -f /tmp/nvmm_preserved 2>/dev/null", timeout=5, retries=0)
+            if getattr(self.args, "llama", False):
+                self.ssh.run("mkdir -p /mnt/demo 2>/dev/null; mount -o ro -L demo /mnt/demo 2>/dev/null || mount -o ro /dev/disk/by-label/demo /mnt/demo 2>/dev/null || mount -o ro /dev/vdc /mnt/demo 2>/dev/null || true", timeout=10)
+            initrd_arg = f"-i {self.guest_initrd} " if getattr(self, "guest_initrd", None) else ""
+            extra_arg = "-k ovm_ipi " if getattr(self.args, "ipi", False) else ""
+            rc, out, err = self.ssh.run(f"ovm_guest -c {self.args.guest_cpus} -m {self.args.guest_memory} {initrd_arg}{extra_arg}-b /tmp", timeout=30)
+            if rc != 0:
+                log_fail(f"[{self.target}] Failed to launch/resume guest VM via ovm_guest: {out} {err}")
+                return False
+            log_info(f"[{self.target}] ovm_guest output: {out}")
+
+            # 8. Sample post-resume progress (allow up to 30s for NanoVMM process launch & attach)
+            recheck_start = time.time()
+            recheck_timeout = max(30 if self.target in ("simics", "arm", "amd", "intel") else 15, int(self.args.duration) * 2 + 15)
+            rate = 0.0
+            while time.time() - recheck_start < recheck_timeout:
+                rate, _ = self.measure_rate("Post-Kexec Resumed", self.args.duration)
+                if rate > 0:
+                    break
+                time.sleep(0.5)
+
+            if rate <= 0:
+                self._dump_diagnostics()
+                log_fail(f"[{self.target}] Guest VM failed to make progress after kexec resume")
+                return False
+            self.result.resumed_rate = f"{rate} {unit}"
+            self.result.kexec_completed += 1
+
+            prog_line = f"Loop {loop}: kexec={kexec_dur}s, in-gap={self.result.ingap_rate}, resumed={self.result.resumed_rate}"
+            self.result.progress_lines.append(prog_line)
+
+        return True
+
+    def run(self) -> TestResult:
+        """Full test execution entry point."""
+        t_start = time.time()
+        self._parse_suspend_cpu_pool()
+        self.result.total_cancel = self.args.cancel_loops * (self.args.kexec_loops if self.args.kexec_loops > 0 else 1)
+        self.result.total_kexec = self.args.kexec_loops
+
+        try:
+            if not self.launch_vm():
+                return self.result
+
+            if not self.wait_for_boot(self.args.hang_timeout):
+                return self.result
+
+            # Auto-detect if booted host kernel supports Caretaker on-core execution
+            if self.args.suspend is None:
+                rc, out, _ = self.ssh.run("/root/ovm/nvmm --caps 2>/dev/null || nvmm --caps 2>/dev/null", timeout=5)
+                has_caretaker = (rc == 0 and "KVM_CAP_CARETAKER: 1" in out)
+                if not has_caretaker:
+                    log_info(f"[{self.target}] Host kernel lacks KVM_CAP_CARETAKER; preserving in RAM (vCPU only)")
+                    self.fifo_pool = ""
+                    self.preserved_pcpus = []
+                    self.preserves_pcpus = False
+                    all_pcpus = set(range(self.args.host_cpus))
+                    self.expected_orphan_online = self._format_cpulist(sorted(list(all_pcpus)))
+                    self.expected_restored_online = self._format_cpulist(sorted(list(all_pcpus)))
+
+            if not self.discover_guest_agents(self.args.agent_timeout):
+                return self.result
+
+            # Initial baseline measurement
+            unit = "tok/s" if getattr(self.args, "llama", False) else "p/s"
+            base_rate, _ = self.measure_rate("Initial Baseline", self.args.duration)
+            self.result.baseline_rate = f"{base_rate} {unit}"
+
+            # Execute cancel-only loops if kexec loops == 0
+            if self.args.kexec_loops == 0 and self.args.cancel_loops > 0:
+                if not self.run_cancel_loops(self.args.cancel_loops):
+                    return self.result
+            elif self.args.kexec_loops > 0:
+                if not self.run_kexec_loops(self.args.kexec_loops):
+                    return self.result
+
+            self.result.overall_status = "PASS"
+            self.result.kexec_status = "PASS" if self.args.kexec_loops > 0 else "N/A"
+        except Exception as e:
+            log_fail(f"[{self.target}] Exception during test run: {e}")
+        finally:
+            self.stop_vm()
+            self.result.duration_sec = round(time.time() - t_start, 2)
+
+        return self.result
+
+
+def build_architectures(archs: List[str], project_root: Path, parallel: bool = True) -> bool:
+    """Compile required architectures."""
+    def _build(arch: str) -> bool:
+        log_info(f"[{arch}] Building architecture...")
+        cmd = f"cd '{project_root}' && source env.sh '{arch}' && make -j$(nproc)"
+        start_ts = time.time()
+        p = subprocess.run(["bash", "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        dur = round(time.time() - start_ts, 2)
+        if p.returncode == 0:
+            log_pass(f"[{arch}] Build completed successfully in {dur}s")
+            return True
+        else:
+            log_fail(f"[{arch}] Build failed after {dur}s:\n{p.stdout[-1000:]}")
+            return False
+
+    if parallel and len(archs) > 1:
+        with ThreadPoolExecutor(max_workers=len(archs)) as executor:
+            results = list(executor.map(_build, archs))
+            return all(results)
+    else:
+        return all(_build(a) for a in archs)
+
+
+@dataclass
+class MatrixEntry:
+    index: int
+    suite_label: str
+    suite_type: str  # 'sym', 'asym', 'ram'
+    host_cpus: int
+    host_mem: str
+    guest_cpus: int
+    guest_mem: str
+    cancel_loops: int
+    kexec_loops: int
+
+
+def run_matrix(args: argparse.Namespace, project_root: Path, matrix_log_dir: Path) -> int:
+    """Execute the full matrix test suite (8 standard configurations)."""
+    configs = [
+        (3, "4G", 2, "256M"),
+        (2, "4G", 1, "256M"),
+        (8, "8G", 4, "4G"),
+    ]
+
+    suites = [
+        ("ovm_test (symmetric)", "sym"),
+        ("ovm_test (asymmetric)", "asym"),
+        ("ovm_test (vCPUs in RAM)", "ram"),
+    ]
+
+    entries: List[MatrixEntry] = []
+    idx = 1
+    for hcpu, hmem, gcpu, gmem in configs:
+        for label, stype in suites:
+            if gcpu <= 1 and stype == "asym":
+                continue
+            entries.append(MatrixEntry(
+                index=idx,
+                suite_label=label,
+                suite_type=stype,
+                host_cpus=hcpu,
+                host_mem=hmem,
+                guest_cpus=gcpu,
+                guest_mem=gmem,
+                cancel_loops=args.cancel_loops,
+                kexec_loops=args.kexec_loops,
+            ))
+            idx += 1
+
+    targets = args.target
+
+    global TEST_LOG_FILE, VERBOSE_MODE
+    TEST_LOG_FILE = matrix_log_dir / "matrix.log"
+    TEST_LOG_FILE.touch()
+    VERBOSE_MODE = args.verbose
+
+    print(f"{COLOR_BOLD}{'=' * 120}{COLOR_RESET}")
+    print(f"{COLOR_BOLD} OrphanVM Matrix Test Suite (Python Edition){COLOR_RESET}")
+    print(f" Log Directory:  {COLOR_CYAN}{matrix_log_dir}{COLOR_RESET}")
+    print(f" Targets:        {COLOR_CYAN}{targets}{COLOR_RESET}  │  Total Configurations: {COLOR_CYAN}{len(entries)}{COLOR_RESET}")
+    print(f" Loops:          {COLOR_CYAN}Cancel: {args.cancel_loops}, Kexec: {args.kexec_loops}{COLOR_RESET}  │  Sampling: {COLOR_CYAN}{args.duration}s{COLOR_RESET}")
+    print(f"{COLOR_BOLD}{'=' * 120}{COLOR_RESET}")
+
+    # Build phase
+    if not args.no_build:
+        target_list = [t.strip() for t in targets.split(",") if t.strip()]
+        archs = sorted(list(set(TARGETS[t].arch for t in target_list if t in TARGETS)))
+        if VERBOSE_MODE:
+            log_info(f"Building architectures: {', '.join(archs)}...")
+        else:
+            print(f" Building binaries ({', '.join(archs)})...", end="", flush=True)
+        if not build_architectures(archs, project_root, parallel=not args.serial):
+            if not VERBOSE_MODE:
+                print(" failed!")
+            print(f"{COLOR_RED}[FAIL] Build phase encountered errors. Details in: {matrix_log_dir / 'matrix.log'}{COLOR_RESET}")
+            return 1
+        if not VERBOSE_MODE:
+            print(" done.")
+
+    print(f" {'#':<3} {'Test Suite':<24} {'Host Config':<18} {'Guest Config':<18} {'Targets':<15} {'Duration':<10} {'Result'}")
+    print(f"{'-' * 120}", flush=True)
+
+    results_summary: List[Tuple[MatrixEntry, float, str]] = []
+    t_suite_start = time.time()
+    has_failure = False
+
+    for entry in entries:
+        if args.suspend is not None:
+            strat_arg = args.suspend
+        elif entry.suite_type == "sym":
+            strat_arg = f"cpu1-{entry.guest_cpus}" if entry.guest_cpus > 1 else "cpu1"
+        elif entry.suite_type == "asym":
+            strat_arg = "cpu1,cpu3" if entry.guest_cpus >= 4 else "cpu1"
+        else:
+            strat_arg = ""  # RAM-only
+
+        # Stale process cleanup
+        subprocess.run("killall -9 qemu-system-aarch64 qemu-system-x86_64 simics-common 2>/dev/null", shell=True)
+        subprocess.run("fuser -k 2222/tcp 2223/tcp 2224/tcp 2225/tcp 1234/tcp 1235/tcp 1236/tcp 1237/tcp 2>/dev/null", shell=True)
+        subprocess.run("rm -f /tmp/ovm_host_mem_* /dev/shm/ovm_host_mem_* 2>/dev/null", shell=True)
+        for _ in range(20):
+            res = subprocess.run("pgrep -f 'qemu-system|simics-common' >/dev/null", shell=True)
+            if res.returncode != 0:
+                break
+            time.sleep(0.2)
+        time.sleep(1)
+
+        # Construct single test args
+        sub_args = argparse.Namespace(
+            target=targets,
+            host_cpus=entry.host_cpus,
+            host_memory=entry.host_mem,
+            guest_cpus=entry.guest_cpus,
+            guest_memory=entry.guest_mem,
+            cancel_loops=entry.cancel_loops,
+            kexec_loops=entry.kexec_loops,
+            duration=args.duration,
+            suspend=strat_arg,
+            no_build=True,
+            kernel=getattr(args, "kernel", None),
+            serial=args.serial,
+            gdb=args.gdb,
+            hang_timeout=args.hang_timeout,
+            kexec_timeout=args.kexec_timeout,
+            agent_timeout=args.agent_timeout,
+            verbose=args.verbose,
+        )
+
+        entry_log = matrix_log_dir / f"test_{entry.index}_{entry.suite_type}_C{entry.host_cpus}_c{entry.guest_cpus}.log"
+        TEST_LOG_FILE = entry_log
+        t0 = time.time()
+
+        # Run target runners
+        target_list = [t.strip() for t in targets.split(",") if t.strip()]
+        runners = [TargetRunner(TARGETS[t], sub_args, project_root, matrix_log_dir) for t in target_list if t in TARGETS]
+
+        if args.serial or len(runners) == 1:
+            sub_results = [r.run() for r in runners]
+        else:
+            with ThreadPoolExecutor(max_workers=len(runners)) as executor:
+                sub_results = list(executor.map(lambda r: r.run(), runners))
+
+        dur = round(time.time() - t0, 1)
+        sub_pass = all(res.overall_status == "PASS" for res in sub_results)
+        status = "PASS" if sub_pass else "FAIL"
+        results_summary.append((entry, dur, status))
+
+        h_desc = f"{entry.host_cpus} vCPUs, {entry.host_mem}"
+        g_desc = f"{entry.guest_cpus} vCPUs, {entry.guest_mem}"
+        stat_colored = f"{COLOR_GREEN}PASS{COLOR_RESET}" if status == "PASS" else f"{COLOR_RED}FAIL{COLOR_RESET}"
+        dur_str = f"{dur:.1f}s"
+        print(f" {entry.index:<3} {entry.suite_label:<24} {h_desc:<18} {g_desc:<18} {targets:<15} {dur_str:<10} {stat_colored}", flush=True)
+
+        if not sub_pass:
+            has_failure = True
+            print(f"\n{COLOR_RED}[FAIL] Configuration {entry.index} failed. Details in: {entry_log}{COLOR_RESET}")
+            break
+
+    total_dur = round(time.time() - t_suite_start, 1)
+    print(f"{COLOR_BOLD}{'=' * 120}{COLOR_RESET}")
+    if not has_failure and len(results_summary) == len(entries):
+        print(f"{COLOR_GREEN}{COLOR_BOLD} >>> ALL {len(entries)} TEST CONFIGURATIONS PASSED in {total_dur}s <<<{COLOR_RESET}")
+    else:
+        print(f"{COLOR_RED}{COLOR_BOLD} >>> MATRIX TEST RUN FAILED in {total_dur}s <<<{COLOR_RESET}")
+    print(f" Detailed logs: {COLOR_CYAN}{matrix_log_dir}{COLOR_RESET}")
+    print(f"{COLOR_BOLD}{'=' * 120}{COLOR_RESET}")
+    return 0 if (not has_failure and len(results_summary) == len(entries)) else 1
+
+
+class HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpFormatter):
+    def _get_help_string(self, action: argparse.Action) -> Optional[str]:
+        if isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction)):
+            return action.help
+        if action.default is None:
+            return action.help
+        return super()._get_help_string(action)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="OrphanVM Unified Test Suite (Python Edition)",
+        formatter_class=HelpFormatter,
+    )
+    parser.add_argument(
+        "-x", "--matrix",
+        action="store_true",
+        help=(
+            "Execute the complete 8-configuration matrix test suite:\n"
+            "  1. Host 3 vCPUs/4G, Guest 2 vCPUs/256M (symmetric: cpu1-2)\n"
+            "  2. Host 3 vCPUs/4G, Guest 2 vCPUs/256M (asymmetric: cpu1)\n"
+            "  3. Host 3 vCPUs/4G, Guest 2 vCPUs/256M (RAM-only)\n"
+            "  4. Host 2 vCPUs/4G, Guest 1 vCPUs/256M (symmetric: cpu1)\n"
+            "  5. Host 2 vCPUs/4G, Guest 1 vCPUs/256M (RAM-only)\n"
+            "  6. Host 8 vCPUs/8G, Guest 4 vCPUs/4G (symmetric: cpu1-4)\n"
+            "  7. Host 8 vCPUs/8G, Guest 4 vCPUs/4G (asymmetric: cpu1,cpu3)\n"
+            "  8. Host 8 vCPUs/8G, Guest 4 vCPUs/4G (RAM-only)"
+        ),
+    )
+    parser.add_argument("-t", "--target", default="amd,arm,intel", help="Target architecture(s) (comma-separated: arm,amd,intel,simics)")
+    parser.add_argument("-C", "--host-cpus", type=int, default=3, help="Number of host vCPUs")
+    parser.add_argument("-M", "--host-memory", default="4G", help="Host RAM size")
+    parser.add_argument("-c", "--guest-cpus", type=int, default=2, help="Number of guest vCPUs")
+    parser.add_argument("-m", "--guest-memory", default="256M", help="Guest RAM size")
+    parser.add_argument(
+        "-l", "--cancel-loops",
+        type=int,
+        default=2,
+        help="Number of intra-kernel live update cancel cycles per test (preserve/unpreserve vCPUs without kexec; supported in single and --matrix modes)",
+    )
+    parser.add_argument(
+        "-k", "--kexec-loops",
+        type=int,
+        default=2,
+        help="Number of host live update kexec cycles per test (preserve vCPUs across host kexec reboot; supported in single and --matrix modes)",
+    )
+    parser.add_argument(
+        "-d", "--duration",
+        type=float,
+        default=0.5,
+        help="Sampling duration in seconds (accepts decimals, default: 0.5)",
+    )
+    parser.add_argument(
+        "-S", "--suspend",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="CPU-POOL",
+        help="Suspend guest VM: with [CPU-POOL] for on-core preservation (e.g. 'cpu1-2', 'cpu1,cpu3') or without CPU pool (omit argument) for vCPU-only RAM preservation",
+    )
+    parser.add_argument("-n", "--no-build", action="store_true", help="Skip build phase")
+    parser.add_argument(
+        "--kernel",
+        type=str,
+        default=None,
+        help="Custom path to host Linux kernel image (e.g. bzImage or Image)",
+    )
+    parser.add_argument("-s", "--serial", action="store_true", help="Run targets sequentially rather than in parallel")
+    parser.add_argument(
+        "-g", "--gdb",
+        action="store_true",
+        help=(
+            "Enable GDB remote debugging stub on host VM startup.\n"
+            "Starts a non-halting GDB TCP remote server on dedicated target ports\n"
+            "(VM boots and runs normally; attach GDB at any time without halting):\n"
+            "  amd:    1234  (QEMU x86_64 / AMD SVM)\n"
+            "  simics: 1235  (Simics x86_64 / Intel Xeon)\n"
+            "  intel:  1236  (QEMU x86_64 / Intel VMX)\n"
+            "  arm:    1237  (QEMU aarch64 / Cortex-A57)\n"
+            "Attach GDB to debug kernel stalls, panics, or Caretaker transitions:\n"
+            "  QEMU:   gdb output_<arch>/linux_host/vmlinux -ex 'target remote :<port>'\n"
+            "  Simics: gdb output_x86_64/linux_host/vmlinux -ex 'target extended-remote :1235'"
+        ),
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose output to stdout (all logs are saved to log directory regardless)",
+    )
+    parser.add_argument("-H", "--hang-timeout", type=int, default=300, help="Host boot/console hang timeout (seconds)")
+    parser.add_argument("-K", "--kexec-timeout", type=int, default=300, help="Kexec reboot timeout (seconds)")
+    parser.add_argument("-A", "--agent-timeout", type=int, default=300, help="Guest agent discovery timeout (seconds)")
+    parser.add_argument(
+        "--llama",
+        action="store_true",
+        help="Execute test using LLaMA 1B on-CPU inference workload (4 vCPUs, 4GB RAM) with direct memory streaming",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Custom path to GGUF model file for --llama mode",
+    )
+    parser.add_argument(
+        "--ipi",
+        action="store_true",
+        help="Execute test using cross-vCPU IPI workload (tests inter-vCPU IPIs / TLB shootdowns)",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Disable automatic model download for --llama mode",
+    )
+
+    args = parser.parse_args()
+    if args.llama:
+        if "-c" not in sys.argv and "--guest-cpus" not in sys.argv:
+            args.guest_cpus = 4
+        if "-m" not in sys.argv and "--guest-memory" not in sys.argv:
+            args.guest_memory = "4G"
+        if "-C" not in sys.argv and "--host-cpus" not in sys.argv:
+            args.host_cpus = max(args.host_cpus, 8)
+        if "-M" not in sys.argv and "--host-memory" not in sys.argv:
+            args.host_memory = "8G"
+    if args.suspend is not None and args.suspend != "":
+        tokens = [t.strip() for t in args.suspend.split(",") if t.strip()]
+        if not tokens:
+            args.suspend = ""
+        else:
+            for tok in tokens:
+                if not re.match(r"^cpu\d+(?:-\d+)?$", tok):
+                    print(f"{COLOR_RED}[FAIL] Invalid CPU pool '{tok}'. To suspend without CPU pool (RAM only), omit the argument to -S/--suspend. To suspend with CPU pool, specify physical CPUs (e.g. -S cpu1-2).{COLOR_RESET}", file=sys.stderr)
+                    return 1
+    project_root = Path(__file__).resolve().parent.parent
+    if project_root.name.startswith("output_"):
+        project_root = project_root.parent
+
+    # Matrix execution mode
+    if args.matrix:
+        # Default targets for matrix mode: arm,amd,intel unless explicitly overridden
+        if args.target == "amd" and "-t" not in sys.argv and "--target" not in sys.argv:
+            args.target = "arm,amd,intel"
+        targets = [t.strip() for t in args.target.split(",") if t.strip()]
+        for t in targets:
+            if t not in TARGETS:
+                print(f"{COLOR_RED}[FAIL] Unknown target '{t}'. Valid targets: {list(TARGETS.keys())}{COLOR_RESET}", file=sys.stderr)
+                return 1
+        ts_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        matrix_log_dir = Path(f"/tmp/ovm_matrix_{ts_str}_{os.getpid()}")
+        matrix_log_dir.mkdir(parents=True, exist_ok=True)
+        return run_matrix(args, project_root, matrix_log_dir)
+
+    # Single configuration execution mode
+    ts_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = Path(f"/tmp/ovm_test_{ts_str}_{os.getpid()}")
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    global TEST_LOG_FILE, VERBOSE_MODE
+    TEST_LOG_FILE = log_dir / "test.log"
+    TEST_LOG_FILE.touch()
+    VERBOSE_MODE = args.verbose
+
+    targets = [t.strip() for t in args.target.split(",") if t.strip()]
+    for t in targets:
+        if t not in TARGETS:
+            log_fail(f"Unknown target '{t}'. Valid targets: {list(TARGETS.keys())}")
+            return 1
+
+    suspend_desc = "auto (symmetric pool)" if args.suspend is None else ("without CPU pool (RAM)" if args.suspend == "" else f"with CPU pool ({args.suspend})")
+    print(f"{COLOR_BOLD}{'=' * 116}{COLOR_RESET}")
+    print(f"{COLOR_BOLD} OrphanVM Automated Test Suite (Python Edition){COLOR_RESET}")
+    print(f" Log Directory:  {COLOR_CYAN}{log_dir}{COLOR_RESET}")
+    print(f" Targets:        {COLOR_CYAN}{', '.join(targets)}{COLOR_RESET}  │  Host: {COLOR_CYAN}{args.host_cpus} vCPUs, {args.host_memory}{COLOR_RESET}  │  Guest: {COLOR_CYAN}{args.guest_cpus} vCPUs, {args.guest_memory}{COLOR_RESET}")
+    gdb_str = f"  │  GDB: {COLOR_CYAN}{', '.join(f'{t}:{TARGETS[t].gdb_port}' for t in targets)}{COLOR_RESET}" if args.gdb else ""
+    print(f" Suspend:        {COLOR_CYAN}{suspend_desc}{COLOR_RESET}  │  Loops: {COLOR_CYAN}Cancel: {args.cancel_loops}, Kexec: {args.kexec_loops}{COLOR_RESET}  │  Sampling: {COLOR_CYAN}{args.duration}s{COLOR_RESET}{gdb_str}")
+    print(f"{COLOR_BOLD}{'=' * 116}{COLOR_RESET}")
+
+    # Build phase
+    if not args.no_build:
+        archs = sorted(list(set(TARGETS[t].arch for t in targets)))
+        if VERBOSE_MODE:
+            log_info(f"Building architectures: {', '.join(archs)}...")
+        else:
+            print(f" Building binaries ({', '.join(archs)})...", end="", flush=True)
+        if not build_architectures(archs, project_root, parallel=not args.serial):
+            if not VERBOSE_MODE:
+                print(" failed!")
+            print(f"{COLOR_RED}[FAIL] Build phase encountered errors. Details in: {log_dir / 'test.log'}{COLOR_RESET}")
+            return 1
+        if not VERBOSE_MODE:
+            print(" done.")
+
+    # Summary table header
+    header = f" {'Platform':<8} {'Host Boot':<11} {'Kexec Boot':<11} {'Cancel':<7} {'Kexec':<7} │ {'Baseline':<13} {'Orphan':<13} {'In-Gap':<13} {'Resumed':<13} │ {'Result':<6}"
+    divider = f"{'-' * 49}┼{'-' * 57}┼{'-' * 8}"
+    print(header)
+    print(divider, flush=True)
+
+    # Run phase
+    runners = [TargetRunner(TARGETS[t], args, project_root, log_dir) for t in targets]
+    results: List[TestResult] = []
+    print_lock = threading.Lock()
+
+    def print_target_result(res: TestResult) -> None:
+        boot_str = f"{res.boot_time_sec}s" if res.boot_time_sec else "N/A"
+        kexec_str = f"{res.kexec_time_sec}s" if res.kexec_time_sec else "N/A"
+        cancel_str = f"{res.cancel_completed}/{res.total_cancel}"
+        kexec_loop_str = f"{res.kexec_completed}/{res.total_kexec}"
+        status_color = f"{COLOR_GREEN}PASS{COLOR_RESET}" if res.overall_status == "PASS" else f"{COLOR_RED}FAIL{COLOR_RESET}"
+
+        row = (
+            f" {res.target:<8} {boot_str:<11} {kexec_str:<11} {cancel_str:<7} {kexec_loop_str:<7} │ "
+            f"{res.baseline_rate:<13} {res.orphan_rate:<13} {res.ingap_rate:<13} {res.resumed_rate:<13} │ {status_color}"
+        )
+        print(row, flush=True)
+        log_to_file(f"[RESULT] {res.target} {res.overall_status} (boot={boot_str}, kexec={kexec_str}, cancel={cancel_str}, kexec_loops={kexec_loop_str})", target=res.target)
+
+    def _run_and_report(runner: TargetRunner) -> TestResult:
+        res = runner.run()
+        with print_lock:
+            print_target_result(res)
+            results.append(res)
+        return res
+
+    if args.serial or len(runners) == 1:
+        for r in runners:
+            _run_and_report(r)
+    else:
+        with ThreadPoolExecutor(max_workers=len(runners)) as executor:
+            list(executor.map(_run_and_report, runners))
+
+    overall_pass = all(res.overall_status == "PASS" for res in results)
+    print(f"{COLOR_BOLD}{'=' * 116}{COLOR_RESET}")
+    if overall_pass:
+        print(f"{COLOR_GREEN}{COLOR_BOLD} >>> ALL TESTS PASSED SUCCESSFULLY <<<{COLOR_RESET}")
+    else:
+        print(f"{COLOR_RED}{COLOR_BOLD} >>> TEST SUITE FAILED <<<{COLOR_RESET}")
+        if not args.gdb:
+            print(f" {COLOR_CYAN}[TIP] Re-run with -g/--gdb to attach GDB and debug host kernel or VM hangs{COLOR_RESET}")
+    print(f" Detailed logs: {COLOR_CYAN}{log_dir}{COLOR_RESET}")
+    print(f"{COLOR_BOLD}{'=' * 116}{COLOR_RESET}")
+    return 0 if overall_pass else 1
+
+if __name__ == "__main__":
+    sys.exit(main())

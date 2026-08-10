@@ -1,0 +1,12 @@
+[Unit]
+Description=Dropbear SSH daemon
+After=network.target
+Wants=network.target
+
+[Service]
+EnvironmentFile=-/etc/default/dropbear
+ExecStart=/usr/sbin/dropbear -F $DROPBEAR_ARGS
+ExecReload=/bin/kill -HUP $MAINPID
+
+[Install]
+WantedBy=multi-user.target

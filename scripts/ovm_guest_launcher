@@ -1,0 +1,81 @@
+#!/bin/sh
+
+# Guest launcher script executed at boot by ovm-guest.service inside the Host VM.
+# Reads the 'ovm_guest=<type>' and 'ovm_guest_log=<target>' parameters from /proc/cmdline.
+
+show_usage() {
+    echo "Usage: $0 [GUEST_TYPE] [OPTIONS]"
+    echo ""
+    echo "Launch guest VM inside the Host VM based on type or kernel cmdline."
+    echo ""
+    echo "Guest Types:"
+    echo "  ovm_guest              Start guest VM using NanoVMM (default)"
+    echo "  ovm_guest_qemu         Start guest VM using QEMU"
+    echo "  none                   Do not start any guest VM"
+    echo ""
+    echo "Options:"
+    echo "  -h, --help             Show this help message"
+}
+
+if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    show_usage
+    exit 0
+fi
+
+GUEST_TYPE="$1"
+LOG_DIR="/tmp"
+
+if [ -f /proc/cmdline ]; then
+    for param in $(cat /proc/cmdline); do
+        case "$param" in
+            ovm_guest_log=*)
+                LOG_DIR="${param#ovm_guest_log=}"
+                ;;
+            ovm_guest_cpus=*)
+                CPUS_FLAG="-c ${param#ovm_guest_cpus=}"
+                ;;
+            ovm_guest_mem=*)
+                MEM_FLAG="-m ${param#ovm_guest_mem=}"
+                ;;
+            ovm_guest_extra=*)
+                EXTRA_FLAG="-k ${param#ovm_guest_extra=}"
+                ;;
+            ovm_guest=*)
+                GUEST_TYPE="${param#ovm_guest=}"
+                ;;
+        esac
+    done
+fi
+
+if [ -z "$GUEST_TYPE" ]; then
+    GUEST_TYPE="ovm_guest"
+fi
+
+# Do not auto-launch a new guest if preserved CPU workload exists from previous kernel
+if [ -s /sys/devices/system/cpu/preserved ]; then
+    PRESERVED_MASK=$(cat /sys/devices/system/cpu/preserved 2>/dev/null | tr -d '[:space:]')
+    if [ -n "$PRESERVED_MASK" ]; then
+        echo "Preserved CPU(s) detected ($PRESERVED_MASK); skipping guest auto-launch."
+        exit 0
+    fi
+fi
+
+case "$GUEST_TYPE" in
+    ovm_guest)
+        echo "Starting guest VM with NanoVMM (ovm_guest)..."
+        exec /usr/bin/ovm_guest $CPUS_FLAG $MEM_FLAG $EXTRA_FLAG -b "$LOG_DIR"
+        ;;
+    ovm_guest_qemu)
+        echo "Starting guest VM with QEMU (ovm_guest_qemu)..."
+        export LOG_FILE="$LOG_DIR/qemu_guest.log"
+        exec /usr/bin/ovm_guest_qemu $CPUS_FLAG $MEM_FLAG
+        ;;
+    none|off|no|disabled|0)
+        echo "Guest VM auto-start is disabled (ovm_guest=$GUEST_TYPE)."
+        exit 0
+        ;;
+    *)
+        echo "Error: Unknown guest type '$GUEST_TYPE'." >&2
+        exit 1
+        ;;
+esac

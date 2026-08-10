@@ -1,0 +1,44 @@
+#!/bin/sh
+PROMPT_FILE="/etc/ovm_llama_prompt.txt"
+MODEL_FILE="/opt/models/model.gguf"
+N_TOKENS="${OVM_LLAMA_TOKENS:-32768}"
+N_THREADS="${OVM_LLAMA_THREADS:-4}"
+
+CMD_TOKENS=$(grep -o 'ovm_tokens=[0-9]*' /proc/cmdline 2>/dev/null | cut -d= -f2)
+if [ -n "$CMD_TOKENS" ]; then
+    N_TOKENS="$CMD_TOKENS"
+fi
+
+CMD_THREADS=$(grep -o 'ovm_threads=[0-9]*' /proc/cmdline 2>/dev/null | cut -d= -f2)
+if [ -n "$CMD_THREADS" ]; then
+    N_THREADS="$CMD_THREADS"
+fi
+
+N_CTX="${OVM_LLAMA_CTX:-4096}"
+
+CMD_CTX=$(grep -o 'ovm_ctx=[0-9]*' /proc/cmdline 2>/dev/null | cut -d= -f2)
+if [ -n "$CMD_CTX" ]; then
+    N_CTX="$CMD_CTX"
+fi
+
+if [ -f "$PROMPT_FILE" ]; then
+    PROMPT="$(cat "$PROMPT_FILE")"
+else
+    PROMPT="Explain operating system live updates and hypervisor architecture in detail."
+fi
+
+if [ ! -f "$MODEL_FILE" ]; then
+    for cand in /opt/models/*.gguf /models/*.gguf /tmp/*.gguf; do
+        if [ -f "$cand" ]; then
+            MODEL_FILE="$cand"
+            break
+        fi
+    done
+fi
+
+echo "[OVM_GUEST] Launching continuous LLaMA inference (threads=$N_THREADS, tokens=$N_TOKENS, ctx=$N_CTX)..."
+while true; do
+    /usr/bin/ovm_llama -m "$MODEL_FILE" -p "$PROMPT" -n "$N_TOKENS" -t "$N_THREADS" -c "$N_CTX" --simple-io -no-cnv --ignore-eos --context-shift > /dev/null 2>&1
+    echo "[OVM_GUEST] LLaMA inference cycle finished with exit code $?, restarting in 1s..."
+    sleep 1
+done

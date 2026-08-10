@@ -1,0 +1,95 @@
+#!/bin/bash
+set -e
+
+# Find relative paths
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "$BIN_DIR" == *"output_"* ]]; then
+    OUT_DIR="$(cd "$BIN_DIR/.." && pwd)"
+    PROJECT_ROOT="$(cd "$OUT_DIR/.." && pwd)"
+else
+    PROJECT_ROOT="$(cd "$BIN_DIR/.." && pwd)"
+fi
+SIMICS_DIR="$PROJECT_ROOT/simics"
+VMP_LOAD_BIN="$SIMICS_DIR/bin/vmp-kernel-load"
+VMP_UNLOAD_BIN="$SIMICS_DIR/bin/vmp-kernel-unload"
+
+show_usage() {
+    echo "Usage: $0 [-u|--unload] [-h|--help]"
+    echo ""
+    echo "Options:"
+    echo "  -u, --unload  Unload Simics VMP kernel driver (/dev/vmx)"
+    echo "  -h, --help    Show this help message"
+}
+
+UNLOAD=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -u|--unload)
+            UNLOAD=1
+            shift
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        *)
+            echo "Error: Unknown argument '$1'" >&2
+            show_usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+SUDO=""
+if [ "$EUID" -ne 0 ]; then
+    SUDO="sudo -n"
+fi
+
+if [ "$UNLOAD" -eq 1 ]; then
+    if ! lsmod | grep -q "^vmxmon "; then
+        echo "Simics VMP hardware acceleration driver (/dev/vmx) is not loaded."
+        exit 0
+    fi
+    echo "Unloading Simics VMP kernel driver (/dev/vmx)..."
+    if [ -x "$VMP_UNLOAD_BIN" ]; then
+        $SUDO "$VMP_UNLOAD_BIN" >/dev/null 2>&1 || $SUDO rmmod vmxmon 2>/dev/null || true
+    else
+        $SUDO rmmod vmxmon 2>/dev/null || true
+    fi
+    $SUDO modprobe kvm_intel 2>/dev/null || $SUDO modprobe kvm_amd 2>/dev/null || true
+    echo "Simics VMP hardware acceleration driver unloaded (/dev/kvm restored)."
+else
+    if [ -c /dev/vmx ] || [ -e /dev/vmx ]; then
+        echo "Simics VMP hardware acceleration driver (/dev/vmx) is already loaded."
+        exit 0
+    fi
+
+    # Simics VMP requires an Intel x86_64 CPU and must run on bare metal (not inside a VM)
+    if [ "$(uname -m)" != "x86_64" ] || ! grep -qi "GenuineIntel" /proc/cpuinfo 2>/dev/null; then
+        echo "Error: Simics VMP hardware acceleration is only supported on Intel x86_64 processors." >&2
+        exit 1
+    fi
+
+    if grep -qw "hypervisor" /proc/cpuinfo 2>/dev/null || \
+       (command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --vm >/dev/null 2>&1); then
+        echo "Error: Simics VMP hardware acceleration requires bare metal (virtual machine detected)." >&2
+        exit 1
+    fi
+
+    echo "Loading Simics VMP kernel driver (/dev/vmx)..."
+    if lsmod | grep -q "^kvm_intel "; then
+        $SUDO rmmod kvm_intel kvm 2>/dev/null || true
+    elif lsmod | grep -q "^kvm "; then
+        $SUDO rmmod kvm 2>/dev/null || true
+    fi
+    if [ -x "$VMP_LOAD_BIN" ]; then
+        $SUDO "$VMP_LOAD_BIN" >/dev/null 2>&1 || true
+    fi
+    if [ -c /dev/vmx ] || [ -e /dev/vmx ]; then
+        echo "Simics VMP hardware acceleration driver (/dev/vmx) loaded successfully."
+    else
+        echo "Error: Failed to load Simics VMP kernel driver (/dev/vmx)." >&2
+        exit 1
+    fi
+fi

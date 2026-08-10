@@ -1,0 +1,17 @@
+[Unit]
+Description=OrphanVM Guest Auto-Launcher
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ovm_guest_launcher
+RemainAfterExit=yes
+KillMode=none
+SendSIGKILL=no
+TimeoutStartSec=120s
+StandardOutput=journal+console
+StandardError=journal+console
+TTYPath=/dev/console
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ARCH="${ARCH:-$(uname -m)}"
+if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+    OUT_ARCH="output_arm64"
+else
+    OUT_ARCH="output_x86_64"
+fi
+OUT_BIN="${ROOT_DIR}/${OUT_ARCH}/bin/ovm_llama"
+
+BUILD_DIR="${TMPDIR:-/tmp}/llama_cpp_build"
+LLAMA_REPO="https://github.com/ggerganov/llama.cpp.git"
+LLAMA_TAG="b4800"
+
+echo "=== Building OrphanVM LLaMA Inference Engine (ovm_llama) ==="
+
+if [ -f "${OUT_BIN}" ] && [ "${1:-}" != "--force" ]; then
+    echo "Binary already exists at ${OUT_BIN}. Use --force to rebuild."
+    exit 0
+fi
+
+mkdir -p "$(dirname "${OUT_BIN}")"
+
+if [ ! -d "${BUILD_DIR}/.git" ]; then
+    echo "Cloning llama.cpp into ${BUILD_DIR}..."
+    git clone --depth 1 "${LLAMA_REPO}" "${BUILD_DIR}"
+fi
+
+STREAM_H="${ROOT_DIR}/tools/ovm_llama_stream.h"
+STREAM_C="${ROOT_DIR}/tools/ovm_llama_stream.c"
+
+if [ ! -f "${STREAM_H}" ] || [ ! -f "${STREAM_C}" ]; then
+    echo "Error: ${STREAM_H} or ${STREAM_C} not found!" >&2
+    exit 1
+fi
+
+echo "Hooking ovm_llama_stream into llama-completion..."
+
+# Hook CMakeLists.txt
+python3 -c "
+path = '${BUILD_DIR}/tools/completion/CMakeLists.txt'
+with open(path, 'r') as f:
+    c = f.read()
+if '${STREAM_C}' not in c:
+    c = c.replace('add_library(\${TARGET} completion.cpp)', 'add_library(\${TARGET} completion.cpp ${STREAM_C})')
+    c = c.replace('target_include_directories(\${TARGET} PUBLIC \${CMAKE_CURRENT_SOURCE_DIR})', 'target_include_directories(\${TARGET} PUBLIC \${CMAKE_CURRENT_SOURCE_DIR} ${ROOT_DIR}/tools)')
+    with open(path, 'w') as f:
+        f.write(c)
+"
+
+# Hook common.cpp to prevent disabling ignore_eos when single EOS is null
+python3 -c "
+path = '${BUILD_DIR}/common/common.cpp'
+with open(path, 'r') as f:
+    c = f.read()
+target = 'if (params.sampling.ignore_eos && llama_vocab_eos(vocab) == LLAMA_TOKEN_NULL) {'
+if target in c:
+    c = c.replace(target, 'if (false && params.sampling.ignore_eos && llama_vocab_eos(vocab) == LLAMA_TOKEN_NULL) {')
+    with open(path, 'w') as f:
+        f.write(c)
+"
+
+# Hook completion.cpp
+python3 -c "
+path = '${BUILD_DIR}/tools/completion/completion.cpp'
+with open(path, 'r') as f:
+    c = f.read()
+if 'ovm_llama_stream.h' not in c:
+    c = '#include \"ovm_llama_stream.h\"\n' + c
+if 'ovm_llama_stream_append' not in c:
+    target = 'output_ss << token_str;'
+    replacement = 'output_ss << token_str;\n                    ovm_llama_stream_append(token_str.c_str(), token_str.size());'
+    c = c.replace(target, replacement, 1)
+
+target_eog = '''if (!embd.empty() && llama_vocab_is_eog(vocab, embd.back()) && !(params.interactive)) {
+            LOG(\" [end of text]\\\\n\");
+            break;
+        }'''
+restart_code = '''if (!embd.empty() && llama_vocab_is_eog(vocab, embd.back()) && !(params.interactive)) {
+            llama_memory_clear(llama_get_memory(ctx), true);
+            common_sampler_reset(smpl);
+            n_past = 0;
+            n_consumed = 0;
+            n_session_consumed = 0;
+            embd.clear();
+            session_tokens.clear();
+            n_remain = params.n_predict;
+            waiting_for_first_input = true;
+            continue;
+        }
+        if (!params.interactive && n_remain <= 0 && params.n_predict >= 0) {
+            llama_memory_clear(llama_get_memory(ctx), true);
+            common_sampler_reset(smpl);
+            n_past = 0;
+            n_consumed = 0;
+            n_session_consumed = 0;
+            embd.clear();
+            session_tokens.clear();
+            n_remain = params.n_predict;
+            waiting_for_first_input = true;
+            continue;
+        }'''
+
+if target_eog in c:
+    c = c.replace(target_eog, restart_code)
+elif '!params.sampling.ignore_eos' in c:
+    old_target = 'if (!embd.empty() && llama_vocab_is_eog(vocab, embd.back()) && !(params.interactive) && !params.sampling.ignore_eos) {\\n            LOG(\" [end of text]\\\\n\");\\n            break;\\n        }'
+    c = c.replace(old_target, restart_code)
+
+with open(path, 'w') as f:
+    f.write(c)
+"
+
+# Hook main.cpp
+python3 -c "
+path = '${BUILD_DIR}/tools/completion/main.cpp'
+with open(path, 'w') as f:
+    f.write('''#include \"ovm_llama_stream.h\"
+
+int llama_completion(int argc, char ** argv);
+
+int main(int argc, char ** argv) {
+    ovm_llama_stream_init();
+    llama_completion(argc, argv);
+    ovm_llama_stream_finish();
+    return 0;
+}
+''')
+"
+
+echo "Configuring and compiling static binary in ${BUILD_DIR}/build..."
+cmake -B "${BUILD_DIR}/build" -S "${BUILD_DIR}" \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DCMAKE_EXE_LINKER_FLAGS="-static" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_NATIVE=OFF \
+    -DGGML_AVX512=OFF \
+    -DGGML_AVX2=ON \
+    -DGGML_FMA=ON \
+    -DGGML_F16C=ON \
+    -DLLAMA_CURL=OFF \
+    -DLLAMA_OPENSSL=OFF \
+    -DGGML_OPENMP=OFF
+
+cmake --build "${BUILD_DIR}/build" --config Release --target llama-completion -j"$(nproc)"
+
+strip -s -o "${OUT_BIN}" "${BUILD_DIR}/build/bin/llama-completion"
+chmod +x "${OUT_BIN}"
+
+echo "Successfully built and installed: ${OUT_BIN}"
+ls -lh "${OUT_BIN}"

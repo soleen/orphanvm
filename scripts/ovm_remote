@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+"""
+OrphanVM Unified Remote Management Utility (SSH, SCP, Kexec)
+
+Consolidated helper for remote execution, file transfers, and host kexec
+live updates across all OrphanVM simulation platforms (AMD, Intel, ARM, Simics).
+"""
+
+import argparse
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+from typing import Dict, List, Optional, Tuple
+
+DEFAULT_PORTS: Dict[str, int] = {
+    "amd": 2222,
+    "arm": 2223,
+    "arm64": 2223,
+    "aarch64": 2223,
+    "simics": 2224,
+    "intel": 2225,
+}
+
+SSH_COMMON_OPTIONS = [
+    "-F", "/dev/null",
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "ConnectTimeout=10",
+    "-o", "ServerAliveInterval=2",
+    "-o", "ServerAliveCountMax=10",
+    "-o", "LogLevel=ERROR",
+]
+
+
+def find_system_binary(name: str) -> str:
+    """Resolve system binary preferring /usr/bin and /bin over user wrappers."""
+    for path in (f"/usr/bin/{name}", f"/bin/{name}"):
+        if os.path.exists(path) and os.access(path, os.X_OK):
+            return path
+    return shutil.which(name) or name
+
+
+def resolve_connection_params(
+    target: Optional[str] = None,
+    port: Optional[int] = None,
+    host: Optional[str] = None,
+    user: Optional[str] = None,
+) -> Tuple[int, str, str]:
+    """Resolve (port, host, user) using arguments, env vars, and target defaults."""
+    resolved_host = host or os.environ.get("SSH_HOST", "127.0.0.1")
+    resolved_user = user or os.environ.get("SSH_USER", "root")
+
+    if port:
+        return port, resolved_host, resolved_user
+
+    if "SSH_PORT" in os.environ:
+        try:
+            return int(os.environ["SSH_PORT"]), resolved_host, resolved_user
+        except ValueError:
+            pass
+
+    if target:
+        t = target.lower().strip()
+        if t in DEFAULT_PORTS:
+            return DEFAULT_PORTS[t], resolved_host, resolved_user
+        if "intel" in t:
+            return DEFAULT_PORTS["intel"], resolved_host, resolved_user
+        if "simics" in t:
+            return DEFAULT_PORTS["simics"], resolved_host, resolved_user
+        if "arm" in t or "aarch" in t:
+            return DEFAULT_PORTS["arm"], resolved_host, resolved_user
+        return DEFAULT_PORTS["amd"], resolved_host, resolved_user
+
+    platform = os.environ.get("OVM_PLATFORM", "").lower()
+    arch = os.environ.get("ARCH", "").lower()
+    combo = f"{platform}:{arch}"
+    if "intel" in combo:
+        return DEFAULT_PORTS["intel"], resolved_host, resolved_user
+    if "simics" in combo:
+        return DEFAULT_PORTS["simics"], resolved_host, resolved_user
+    if "arm" in combo or "aarch" in combo:
+        return DEFAULT_PORTS["arm"], resolved_host, resolved_user
+    return DEFAULT_PORTS["amd"], resolved_host, resolved_user
+
+
+def run_ssh_internal(
+    port: int,
+    host: str,
+    user: str,
+    cmd: str,
+    timeout: Optional[float] = None,
+) -> subprocess.CompletedProcess:
+    """Run an SSH command non-interactively and return CompletedProcess."""
+    ssh_bin = find_system_binary("ssh")
+    full_cmd = [
+        ssh_bin,
+        *SSH_COMMON_OPTIONS,
+        "-p", str(port),
+        f"{user}@{host}",
+        cmd,
+    ]
+    return subprocess.run(full_cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def handle_ssh(args: List[str]) -> int:
+    """Execute SSH with target resolution and pass-through flags."""
+    target = None
+    port = None
+    host = None
+    user = None
+    extra_flags: List[str] = []
+    cmd_args: List[str] = []
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-h", "--help"):
+            print("Usage: ovm_remote ssh [OPTIONS] [COMMAND...]")
+            print("       ovm_ssh [OPTIONS] [COMMAND...]\n")
+            print("Options:")
+            print("  -t, --target TARGET   Target platform (amd, arm, intel, simics)")
+            print("  -p, --port PORT       Override SSH port")
+            print("  -H, --host HOST       Override target host (default: 127.0.0.1)")
+            print("  -u, --user USER       Override target user (default: root)")
+            print("  -h, --help            Show this help message")
+            print("\nAny other flags (-o, -i, etc.) are passed directly to ssh.")
+            return 0
+        elif arg in ("-t", "--target") and i + 1 < len(args):
+            target = args[i + 1]
+            i += 2
+        elif arg.startswith("--target="):
+            target = arg.split("=", 1)[1]
+            i += 1
+        elif arg in ("-p", "--port") and i + 1 < len(args):
+            try:
+                port = int(args[i + 1])
+            except ValueError:
+                pass
+            i += 2
+        elif arg.startswith("--port="):
+            try:
+                port = int(arg.split("=", 1)[1])
+            except ValueError:
+                pass
+            i += 1
+        elif arg in ("-H", "--host") and i + 1 < len(args):
+            host = args[i + 1]
+            i += 2
+        elif arg.startswith("--host="):
+            host = arg.split("=", 1)[1]
+            i += 1
+        elif arg in ("-u", "--user") and i + 1 < len(args):
+            user = args[i + 1]
+            i += 2
+        elif arg.startswith("--user="):
+            user = arg.split("=", 1)[1]
+            i += 1
+        elif arg in ("-o", "-i", "-l", "-c", "-b", "-m", "-F") and i + 1 < len(args):
+            extra_flags.extend([arg, args[i + 1]])
+            i += 2
+        elif arg.startswith("-"):
+            extra_flags.append(arg)
+            i += 1
+        else:
+            cmd_args = args[i:]
+            break
+
+    res_port, res_host, res_user = resolve_connection_params(target, port, host, user)
+    ssh_bin = find_system_binary("ssh")
+    full_cmd = [
+        ssh_bin,
+        *SSH_COMMON_OPTIONS,
+        *extra_flags,
+        "-p", str(res_port),
+        f"{res_user}@{res_host}",
+    ]
+    if cmd_args:
+        full_cmd.extend(cmd_args)
+
+    os.execvp(full_cmd[0], full_cmd)
+
+
+def handle_scp(args: List[str]) -> int:
+    """Execute SCP with remote syntax transformation (:file -> user@host:file)."""
+    target = None
+    port = None
+    host = None
+    user = None
+    extra_flags: List[str] = []
+    path_args: List[str] = []
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-h", "--help"):
+            print("Usage: ovm_remote scp [OPTIONS] SRC [SRC...] DEST")
+            print("       ovm_scp [OPTIONS] LOCAL_PATH REMOTE_PATH\n")
+            print("Options:")
+            print("  -t, --target TARGET   Target platform (amd, arm, intel, simics)")
+            print("  -p, -P, --port PORT   Override SSH/SCP port")
+            print("  -H, --host HOST       Override target host (default: 127.0.0.1)")
+            print("  -u, --user USER       Override target user (default: root)")
+            print("  -h, --help            Show this help message")
+            print("\nPrefix remote paths with ':' (e.g. ':file' -> 'root@localhost:file').")
+            print("If two arguments without ':' are provided, the second is treated as remote.")
+            return 0
+        elif arg in ("-t", "--target") and i + 1 < len(args):
+            target = args[i + 1]
+            i += 2
+        elif arg.startswith("--target="):
+            target = arg.split("=", 1)[1]
+            i += 1
+        elif arg in ("-p", "-P", "--port") and i + 1 < len(args):
+            try:
+                port = int(args[i + 1])
+            except ValueError:
+                pass
+            i += 2
+        elif arg.startswith("--port="):
+            try:
+                port = int(arg.split("=", 1)[1])
+            except ValueError:
+                pass
+            i += 1
+        elif arg in ("-H", "--host") and i + 1 < len(args):
+            host = args[i + 1]
+            i += 2
+        elif arg.startswith("--host="):
+            host = arg.split("=", 1)[1]
+            i += 1
+        elif arg in ("-u", "--user") and i + 1 < len(args):
+            user = args[i + 1]
+            i += 2
+        elif arg.startswith("--user="):
+            user = arg.split("=", 1)[1]
+            i += 1
+        elif arg in ("-o", "-i", "-F") and i + 1 < len(args):
+            extra_flags.extend([arg, args[i + 1]])
+            i += 2
+        elif arg.startswith("-"):
+            extra_flags.append(arg)
+            i += 1
+        else:
+            path_args.append(arg)
+            i += 1
+
+    if not path_args:
+        print("Error: No source and destination paths specified.", file=sys.stderr)
+        return 1
+
+    res_port, res_host, res_user = resolve_connection_params(target, port, host, user)
+
+    # Remote argument transformation
+    remote_prefix = f"{res_user}@{res_host}:"
+    transformed_paths: List[str] = []
+    if len(path_args) == 2 and ":" not in path_args[0] and ":" not in path_args[1]:
+        transformed_paths = [path_args[0], f"{remote_prefix}{path_args[1]}"]
+    else:
+        for p in path_args:
+            if p.startswith(":"):
+                transformed_paths.append(f"{remote_prefix}{p[1:]}")
+            else:
+                transformed_paths.append(p)
+
+    scp_bin = find_system_binary("scp")
+    full_cmd = [
+        scp_bin,
+        "-F", "/dev/null",
+        "-O",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10",
+        "-o", "ServerAliveInterval=2",
+        "-o", "ServerAliveCountMax=10",
+        "-o", "LogLevel=ERROR",
+        *extra_flags,
+        "-P", str(res_port),
+        *transformed_paths,
+    ]
+
+    os.execvp(full_cmd[0], full_cmd)
+
+
+def handle_kexec(args: List[str]) -> int:
+    """Stage, load, and execute host kexec live reboot."""
+    prog = "ovm_kexec" if "kexec" in Path(sys.argv[0]).name else "ovm_remote kexec"
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description="Transfer, load, and execute host kexec reboot over SSH.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("-t", "--target", default=None, help="Target platform (amd, arm, intel, simics)")
+    parser.add_argument("-p", "--port", type=int, default=None, help="SSH port")
+    parser.add_argument("-H", "--host", default=None, help="Target host")
+    parser.add_argument("-u", "--user", default=None, help="Target user")
+    parser.add_argument("-l", "--load", action="store_true", help="Only transfer and load kernel into memory (kexec -l)")
+    parser.add_argument("-e", "--exec", action="store_true", dest="execute", help="Only execute the loaded kexec reboot (kexec -e)")
+    parser.add_argument("--timeout", type=int, default=120, help="Host reboot wait timeout in seconds")
+
+    parsed = parser.parse_args(args)
+
+    do_load = True
+    do_exec = True
+    if parsed.load and not parsed.execute:
+        do_exec = False
+    elif parsed.execute and not parsed.load:
+        do_load = False
+
+    port, host, user = resolve_connection_params(parsed.target, parsed.port, parsed.host, parsed.user)
+
+    # Determine project directory and output directory
+    script_dir = Path(__file__).resolve().parent
+    if "output_" in script_dir.name or (script_dir.parent.name.startswith("output_")):
+        out_dir = script_dir if "output_" in script_dir.name else script_dir.parent
+        project_root = out_dir.parent
+    else:
+        project_root = script_dir.parent
+        target_name = (parsed.target or os.environ.get("ARCH") or "amd").lower()
+        if "arm" in target_name or "aarch" in target_name:
+            out_dir = project_root / "output_arm64"
+        else:
+            out_dir = project_root / "output_x86_64"
+
+    is_arm = "arm64" in out_dir.name or "aarch" in out_dir.name
+    if is_arm:
+        kernel_path = out_dir / "linux_host" / "arch" / "arm64" / "boot" / "Image"
+    else:
+        kernel_path = out_dir / "linux_host" / "arch" / "x86" / "boot" / "bzImage"
+
+    if do_load:
+        if not kernel_path.is_file():
+            print(f"Error: Host kernel image not found at '{kernel_path}'. Please build it first.", file=sys.stderr)
+            return 1
+
+        print("=== Host Kexec Staging ===")
+        print(f"Target:      Port {port} ({host})")
+        print(f"Kernel:      {kernel_path}")
+        print("--------------------------------------------------------")
+
+        kernel_name = kernel_path.name
+
+        # Update ext4 kernel disk images via debugfs if present
+        if shutil.which("debugfs"):
+            for kd in out_dir.glob("kernel_disk*.ext4"):
+                if kd.is_file():
+                    subprocess.run(["debugfs", "-w", "-R", f"rm {kernel_name}", str(kd)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(["debugfs", "-w", "-R", f"write {kernel_path} {kernel_name}", str(kd)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        print(f"Loading kernel into host memory from {kernel_name} (kexec -l)...")
+        stage_script = (
+            "mkdir -p /mnt/boot 2>/dev/null || true; "
+            "mount -o ro /dev/vdb /mnt/boot 2>/dev/null || true; "
+            "kexec -u 2>/dev/null || true; "
+            "CMDLINE=$(cat /proc/cmdline 2>/dev/null | tr ' ' '\\n' | awk 'NF && !seen[$0]++' | tr '\\n' ' '); "
+            f"kexec -s -l /mnt/boot/{kernel_name} --command-line=\"$CMDLINE\" || "
+            f"kexec -l /mnt/boot/{kernel_name} --command-line=\"$CMDLINE\" || "
+            f"kexec -s -l /boot/{kernel_name} --command-line=\"$CMDLINE\" || "
+            f"kexec -l /boot/{kernel_name} --command-line=\"$CMDLINE\"; "
+            "rc=$?; "
+            "umount /mnt/boot 2>/dev/null || true; "
+            "exit $rc"
+        )
+        res = run_ssh_internal(port, host, user, stage_script, timeout=30)
+        if res.returncode != 0:
+            print(f"[FAIL] Kernel staging failed: {res.stderr or res.stdout}", file=sys.stderr)
+            return 1
+        print("[PASS] Kernel loaded successfully.")
+
+    if do_exec:
+        if not do_load:
+            print("=== Host Kexec Execution ===")
+            print("--------------------------------------------------------")
+
+        print("[Kexec] Triggering host kexec reboot...")
+        pre_id_proc = run_ssh_internal(port, host, user, "cat /proc/sys/kernel/random/boot_id 2>/dev/null", timeout=5)
+        pre_boot_id = pre_id_proc.stdout.strip() if pre_id_proc.returncode == 0 else ""
+
+        t_start = time.time()
+        run_ssh_internal(
+            port, host, user,
+            "nohup sh -c 'sleep 0.2; sync; echo s > /proc/sysrq-trigger 2>/dev/null || true; echo u > /proc/sysrq-trigger 2>/dev/null || true; sleep 0.1; exec kexec -e' </dev/null >/dev/null 2>&1 &",
+            timeout=5,
+        )
+
+        print("[Kexec] Waiting for host reboot...")
+        time.sleep(0.5)
+
+        post_boot_id = ""
+        while time.time() - t_start < parsed.timeout:
+            proc = run_ssh_internal(port, host, user, "cat /proc/sys/kernel/random/boot_id 2>/dev/null", timeout=3)
+            if proc.returncode == 0:
+                bid = proc.stdout.strip()
+                if bid and bid != pre_boot_id:
+                    post_boot_id = bid
+                    break
+            time.sleep(0.1)
+
+        dur = time.time() - t_start
+        if not post_boot_id:
+            print(f"[FAIL] Host VM did not complete kexec reboot within {parsed.timeout} seconds.", file=sys.stderr)
+            return 1
+
+        print(f"[PASS] Host kexec reboot completed successfully in {dur:.3f} seconds!")
+
+    return 0
+
+
+def main() -> int:
+    prog_name = Path(sys.argv[0]).name
+    args = sys.argv[1:]
+
+    # Multi-call dispatcher
+    if prog_name in ("ovm_ssh", "ssh"):
+        return handle_ssh(args)
+    if prog_name in ("ovm_scp", "scp"):
+        return handle_scp(args)
+    if prog_name in ("ovm_kexec", "kexec"):
+        return handle_kexec(args)
+
+    if not args or args[0] in ("-h", "--help"):
+        print("Usage: ovm_remote <command> [OPTIONS] [ARGS...]\n")
+        print("Commands:")
+        print("  ssh      SSH into host VM with target auto-detection")
+        print("  scp      SCP files to/from host VM (:file notation supported)")
+        print("  kexec    Stage, load, and execute host kexec reboot\n")
+        print("Options:")
+        print("  -h, --help   Show this help message")
+        return 0
+
+    subcmd = args[0]
+    subargs = args[1:]
+
+    if subcmd == "ssh":
+        return handle_ssh(subargs)
+    elif subcmd == "scp":
+        return handle_scp(subargs)
+    elif subcmd == "kexec":
+        return handle_kexec(subargs)
+    else:
+        print(f"Error: Unknown subcommand '{subcmd}'. Valid subcommands: ssh, scp, kexec", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
