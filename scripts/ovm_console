@@ -1,0 +1,40 @@
+#!/bin/bash
+show_usage() {
+    echo "Usage: $0 [PORT] [HOST]"
+    echo ""
+    echo "Auto-reconnecting serial console client for Simics."
+    echo ""
+    echo "Arguments:"
+    echo "  PORT           Simics telnet console port (default: 4000)"
+    echo "  HOST           Simics telnet console host (default: 127.0.0.1)"
+    echo ""
+    echo "Options:"
+    echo "  -h, --help     Show this help message"
+}
+
+if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    show_usage
+    exit 0
+fi
+
+PORT=${1:-4000}
+HOST=${2:-127.0.0.1}
+
+if ! command -v telnet >/dev/null 2>&1; then
+    echo "Error: telnet is not installed. Please install telnet." >&2
+    exit 1
+fi
+
+trap "echo -e '\n[Host Console] Exiting.'; exit 0" SIGINT SIGTERM
+
+echo "[Host Console] Waiting for Simics serial console on $HOST:$PORT..."
+
+while true; do
+    # Quietly check if port is open without printing terminal output
+    if (echo > /dev/tcp/$HOST/$PORT) 2>/dev/null; then
+        echo -e "\n[Host Console] Connected to Simics serial console ($HOST:$PORT)."
+        telnet $HOST $PORT 2>/dev/null
+        echo -e "\n[Host Console] Connection closed. Waiting for Simics..."
+    fi
+    sleep 0.2
+done

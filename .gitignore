@@ -1,0 +1,14 @@
+output_x86_64
+output_arm64
+simics
+overlays/buildroot_guest/usr/bin/guest_time_*
+overlays/buildroot_guest/usr/bin/guest_agent
+overlays/buildroot_guest/usr/bin/ovm_agent
+tools/ovm_agent
+tools/ovm_monitor
+tools/ovm_ipi_test
+scratch/
+/sbin
+**/__pycache__
+assets/models/*.gguf
+assets/bin/

@@ -1,0 +1,200 @@
+#!/bin/sh
+
+show_usage() {
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Launch OrphanVM guest VM using NanoVMM."
+    echo ""
+    echo "Options:"
+    echo "  -s, --session NAME        NanoVMM session name (default: orphanvm_session)"
+    echo "  -m, --memory MEM          Guest RAM size (default: 128M)"
+    echo "  -c, --cpus CPUS           Number of guest vCPUs (default: 1)"
+    echo "  -i, --initrd PATH         Path to custom guest initrd/rootfs"
+    echo "  -b, --background LOG_DIR  Run NanoVMM in background and write logs to LOG_DIR"
+    echo "  -h, --help                Show this help message"
+}
+
+SESSION_NAME="${SESSION_NAME:-orphanvm_session}"
+LOG_DIR=""
+MEM_SIZE="${MEM_SIZE:-128M}"
+VCPUS="${VCPUS:-1}"
+CUSTOM_INITRD=""
+BACKGROUND=false
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -s|--session)
+            SESSION_NAME="$2"
+            shift 2
+            ;;
+        -m|--memory)
+            MEM_SIZE="$2"
+            shift 2
+            ;;
+        -c|--cpus)
+            VCPUS="$2"
+            shift 2
+            ;;
+        -i|--initrd)
+            CUSTOM_INITRD="$2"
+            shift 2
+            ;;
+        -b|--background)
+            BACKGROUND=true
+            case "$2" in
+                ""|-*)
+                    echo "Error: -b/--background requires a log directory argument" >&2
+                    show_usage >&2
+                    exit 1
+                    ;;
+                *)
+                    LOG_DIR="$2"
+                    shift 2
+                    ;;
+            esac
+            ;;
+        -k|--extra-cmdline)
+            EXTRA_CMDLINE="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        *)
+            echo "Error: Unknown argument '$1'" >&2
+            show_usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Check if we are running inside the Host VM
+if [ -d "/opt/guest" ] && [ -f "/opt/guest/kernel" ]; then
+    # Running inside the Host VM
+    NVMM="/usr/bin/nvmm"
+    KERNEL="/opt/guest/kernel"
+    INITRD="${CUSTOM_INITRD:-/opt/guest/rootfs.cpio.lz4}"
+    if [ ! -f "$INITRD" ]; then
+        INITRD=$(ls /opt/guest/rootfs.cpio* 2>/dev/null | head -n 1)
+    fi
+else
+    # Running from local workspace
+    BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+    case "$BIN_DIR" in
+        *output_*)
+            OUT_DIR="$(cd "$BIN_DIR/.." && pwd)"
+            ;;
+        *)
+            PROJECT_ROOT="$(cd "$BIN_DIR/.." && pwd)"
+            TARGET_ARCH="${ARCH:-$(uname -m)}"
+            if [ "$TARGET_ARCH" = "aarch64" ] || [ "$TARGET_ARCH" = "arm64" ]; then
+                OUT_DIR="$PROJECT_ROOT/output_arm64"
+            else
+                OUT_DIR="$PROJECT_ROOT/output_x86_64"
+            fi
+            ;;
+    esac
+
+    NVMM="$OUT_DIR/bin/nvmm"
+    INITRD="${CUSTOM_INITRD:-$OUT_DIR/buildroot_guest/images/rootfs.cpio.lz4}"
+    case "$OUT_DIR" in
+        *arm64*)
+            KERNEL="$OUT_DIR/linux_guest/arch/arm64/boot/Image"
+            ;;
+        *)
+            KERNEL="$OUT_DIR/linux_guest/arch/x86/boot/bzImage"
+            ;;
+    esac
+fi
+
+# Check if required components are built/found
+if [ -z "$KERNEL" ] || [ ! -f "$KERNEL" ]; then
+    echo "Error: Kernel image not found at $KERNEL. Please build it first." >&2
+    exit 1
+fi
+
+if [ ! -f "$INITRD" ]; then
+    echo "Error: Initramfs not found at $INITRD. Please build buildroot first." >&2
+    exit 1
+fi
+
+if [ ! -f "$NVMM" ]; then
+    echo "Error: nanovmm binary not found at $NVMM. Please build it first." >&2
+    exit 1
+fi
+
+ARCH=$(uname -m)
+if [ "$ARCH" = "aarch64" ]; then
+    CONSOLE="ttyAMA0"
+    EARLYCON="earlycon=pl011,0x09000000"
+    CLK_OPT=""
+else
+    CONSOLE="ttyS0"
+    EARLYCON="earlyprintk=ttyS0,115200"
+    CLK_OPT="clocksource=tsc tsc=reliable idle=halt"
+fi
+
+CMDLINE="console=$CONSOLE $EARLYCON ignore_loglevel panic=0 panic_console_replay=1 panic_print=0 nowatchdog nosoftlockup default_hugepagesz=2M hugepages=8 $CLK_OPT ${EXTRA_CMDLINE:-}"
+
+if [ ! -e /dev/kvm ]; then
+    modprobe kvm_intel 2>/dev/null || modprobe kvm_amd 2>/dev/null || modprobe kvm 2>/dev/null || true
+fi
+
+echo "Launching NanoVMM..."
+echo "Kernel:  $KERNEL"
+echo "Initrd:  $INITRD"
+echo "Memory:  $MEM_SIZE"
+echo "vCPUs:   $VCPUS"
+echo "Session: $SESSION_NAME"
+echo "Cmdline: $CMDLINE"
+echo "--------------------------------------------------------"
+
+if [ "$BACKGROUND" = true ]; then
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+    LOG_FILE="$LOG_DIR/guest_monitor.log"
+    NVMM_LOG_FILE="$LOG_DIR/nvmm.log"
+
+    STDBUF_CMD="stdbuf -oL -eL"
+    if ! command -v stdbuf >/dev/null 2>&1; then
+        STDBUF_CMD=""
+    fi
+
+    # Sample workload pass before launching/resuming NanoVMM
+    PASS_FILE="/tmp/ovm_resume_passes.txt"
+    rm -f "$PASS_FILE" 2>/dev/null || true
+    OFF=$(grep -o 'ovm_agent_offset=[^ ]*' /proc/cmdline 2>/dev/null | cut -d= -f2 || true)
+    if [ -n "$OFF" ] && command -v ovm_monitor >/dev/null 2>&1; then
+        P_BR=$(ovm_monitor -O "$OFF" 2>/dev/null || true)
+        [ -n "$P_BR" ] && echo "PASS_BEFORE_RESUME=$P_BR" >> "$PASS_FILE"
+    fi
+
+    # Launch the VM in background
+    rm -f /tmp/nvmm_preserved 2>/dev/null || true
+    echo "Launching NanoVMM in background (process: $NVMM_LOG_FILE)..."
+    nohup setsid "$NVMM" -s "$SESSION_NAME" -k "$KERNEL" -i "$INITRD" -m "$MEM_SIZE" -c "$VCPUS" -p "$CMDLINE" </dev/null > "$NVMM_LOG_FILE" 2>&1 &
+    NVMM_PID=$!
+    disown "$NVMM_PID" 2>/dev/null || true
+    echo "$NVMM_PID" > "$LOG_DIR/nvmm.pid"
+    echo "NanoVMM background PID: $NVMM_PID. View logs with: tail -f $NVMM_LOG_FILE"
+
+    sleep 0.1
+    if ! kill -0 "$NVMM_PID" 2>/dev/null; then
+        echo "NanoVMM died immediately! Process log ($NVMM_LOG_FILE):"
+        cat "$NVMM_LOG_FILE" 2>/dev/null || true
+    fi
+
+    # Sample workload pass immediately after resuming NanoVMM
+    if [ -n "$OFF" ] && command -v ovm_monitor >/dev/null 2>&1; then
+        for i in $(seq 1 100); do
+            kill -0 "$NVMM_PID" 2>/dev/null && break
+            usleep 1000
+        done
+        usleep 5000
+        P_AR=$(ovm_monitor -O "$OFF" 2>/dev/null || true)
+        [ -n "$P_AR" ] && echo "PASS_AFTER_RESUME=$P_AR" >> "$PASS_FILE"
+    fi
+else
+    echo "Launching NanoVMM in foreground..."
+    exec "$NVMM" -s "$SESSION_NAME" -k "$KERNEL" -i "$INITRD" -m "$MEM_SIZE" -c "$VCPUS" -p "$CMDLINE"
+fi

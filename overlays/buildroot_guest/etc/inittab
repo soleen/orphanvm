@@ -1,0 +1,8 @@
+# /etc/inittab for BusyBox init in guest VM
+::sysinit:/bin/mount -t proc proc /proc
+::sysinit:/bin/mount -t sysfs sysfs /sys
+::sysinit:/bin/mount -t devtmpfs devtmpfs /dev
+::sysinit:/bin/hostname buildroot
+::sysinit:/etc/init.d/S99ovm_agent start
+::respawn:/sbin/getty -L -n -l /usr/bin/autologin 115200 ttyS0 vt100
+::shutdown:/bin/umount -a -r

@@ -1,0 +1,35 @@
+#!/bin/sh
+case "$1" in
+    start)
+        echo "Starting guest workload agent(s)..."
+        if [ -x /usr/bin/ovm_ipi_test ] && grep -q "ovm_ipi" /proc/cmdline; then
+            echo "Starting guest cross-vCPU IPI workload..."
+            nice -n -20 /usr/bin/ovm_ipi_test >/tmp/ovm_ipi.log 2>&1 &
+        elif [ -x /usr/bin/ovm_llama ] && [ -x /usr/bin/ovm_llama_workload ]; then
+            echo "Starting guest LLaMA workload..."
+            /usr/bin/ovm_llama_workload >/tmp/ovm_llama.log 2>&1 &
+        elif [ -x /usr/bin/ovm_agent ]; then
+            for cpu_dir in /sys/devices/system/cpu/cpu[0-9]*; do
+                [ -d "$cpu_dir" ] || continue
+                cpu_id="${cpu_dir##*/cpu}"
+                if [ "$cpu_id" = "0" ] || [ ! -f "$cpu_dir/online" ] || [ "$(cat "$cpu_dir/online" 2>/dev/null)" = "1" ]; then
+                    echo "Starting guest agent on CPU $cpu_id..."
+                    nice -n -20 /usr/bin/ovm_agent -c "$cpu_id" &
+                    sleep 0.05
+                fi
+            done
+            sleep 0.2
+        fi
+        ;;
+    stop)
+        echo "Stopping guest workload agent(s)..."
+        killall ovm_llama 2>/dev/null || true
+        killall ovm_ipi_test 2>/dev/null || true
+        killall ovm_agent 2>/dev/null || true
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}"
+        exit 1
+        ;;
+esac
+exit 0

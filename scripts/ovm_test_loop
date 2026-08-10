@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+#
+# ovm_test_loop: Run OrphanVM test suite in a loop (default: 10 iterations)
+#
+# Usage:
+#   ./scripts/ovm_test_loop [OPTIONS] [NUM_ITERATIONS] [-- OVM_TEST_ARGS...]
+#
+# Examples:
+#   ./scripts/ovm_test_loop                              # Runs 10 iterations of: ./scripts/ovm_test -t amd,intel -k 1 -l 1
+#   ./scripts/ovm_test_loop 5                            # Runs 5 iterations
+#   ./scripts/ovm_test_loop -n 10 -e                     # Runs 10 iterations, stops on first failure
+#   ./scripts/ovm_test_loop 10 -- -t intel,amd,arm -l 2  # Custom ovm_test args
+#
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Locate ovm_test binary
+OVM_TEST=""
+if [ -x "$SCRIPT_DIR/ovm_test" ]; then
+    OVM_TEST="$SCRIPT_DIR/ovm_test"
+elif [ -x "./scripts/ovm_test" ]; then
+    OVM_TEST="./scripts/ovm_test"
+elif [ -x "$SCRIPT_DIR/../../orphanvm/scripts/ovm_test" ]; then
+    OVM_TEST="$(realpath "$SCRIPT_DIR/../../orphanvm/scripts/ovm_test")"
+elif [ -x "../orphanvm/scripts/ovm_test" ]; then
+    OVM_TEST="$(realpath "../orphanvm/scripts/ovm_test")"
+else
+    echo "Error: Cannot locate ovm_test script." >&2
+    exit 1
+fi
+OVM_TEST="$(realpath "$OVM_TEST")"
+
+# Defaults
+NUM_ITERATIONS=10
+STOP_ON_FAIL=false
+DEFAULT_ARGS=("-t" "amd,intel" "-k" "1" "-l" "1")
+CUSTOM_ARGS=()
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS] [NUM_ITERATIONS] [-- OVM_TEST_ARGS...]
+
+Run ovm_test in a loop for testing stability and detecting flaky runs.
+
+Options:
+  -n, --iterations N   Number of iterations to run (default: 10)
+  -e, --stop-on-fail   Stop immediately if any iteration fails
+  -k, --keep-going     Continue running remaining iterations on failure (default)
+  -h, --help           Show this help message
+
+Default command per iteration:
+  $OVM_TEST -t amd,intel -k 1 -l 1
+
+Examples:
+  $(basename "$0")                    # 10 iterations of default command
+  $(basename "$0") 5                  # 5 iterations
+  $(basename "$0") -n 10 -e           # 10 iterations, exit on first failure
+  $(basename "$0") 10 -- -t intel -l 2 -k 2
+EOF
+    exit 0
+}
+
+# Parse options
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            ;;
+        -n|--iterations)
+            NUM_ITERATIONS="$2"
+            shift 2
+            ;;
+        -e|--stop-on-fail)
+            STOP_ON_FAIL=true
+            shift
+            ;;
+        -k|--keep-going)
+            STOP_ON_FAIL=false
+            shift
+            ;;
+        --)
+            shift
+            CUSTOM_ARGS=("$@")
+            break
+            ;;
+        [0-9]*)
+            NUM_ITERATIONS="$1"
+            shift
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            usage
+            ;;
+    esac
+done
+
+if [[ ${#CUSTOM_ARGS[@]} -gt 0 ]]; then
+    TEST_ARGS=("${CUSTOM_ARGS[@]}")
+else
+    TEST_ARGS=("${DEFAULT_ARGS[@]}")
+fi
+
+COLOR_BOLD="\033[1m"
+COLOR_GREEN="\033[1;32m"
+COLOR_RED="\033[1;31m"
+COLOR_YELLOW="\033[1;33m"
+COLOR_CYAN="\033[1;36m"
+COLOR_RESET="\033[0m"
+
+echo -e "${COLOR_BOLD}================================================================================${COLOR_RESET}"
+echo -e "${COLOR_BOLD} OrphanVM Test Loop Runner${COLOR_RESET}"
+echo -e " Command:     ${COLOR_CYAN}$OVM_TEST ${TEST_ARGS[*]}${COLOR_RESET}"
+echo -e " Iterations:  ${COLOR_CYAN}$NUM_ITERATIONS${COLOR_RESET}"
+echo -e " On Failure:  ${COLOR_CYAN}$([ "$STOP_ON_FAIL" = true ] && echo "Stop immediately (-e)" || echo "Continue remaining runs")${COLOR_RESET}"
+echo -e "${COLOR_BOLD}================================================================================${COLOR_RESET}"
+
+declare -a RESULTS
+declare -a DURATIONS
+TOTAL_START=$(date +%s)
+PASSED_COUNT=0
+FAILED_COUNT=0
+
+# Handle Ctrl+C cleanly
+trap 'echo -e "\n${COLOR_YELLOW}[!] Test loop interrupted by user.${COLOR_RESET}"; print_summary; exit 130' INT
+
+print_summary() {
+    local total_end
+    total_end=$(date +%s)
+    local total_elapsed=$((total_end - TOTAL_START))
+    local total_min=$((total_elapsed / 60))
+    local total_sec=$((total_elapsed % 60))
+
+    echo -e "\n${COLOR_BOLD}================================================================================${COLOR_RESET}"
+    echo -e "${COLOR_BOLD} Test Loop Summary${COLOR_RESET}"
+    echo -e "${COLOR_BOLD}================================================================================${COLOR_RESET}"
+    local completed=${#RESULTS[@]}
+    for ((i=1; i<=completed; i++)); do
+        local idx=$((i-1))
+        local res="${RESULTS[$idx]}"
+        local dur="${DURATIONS[$idx]}"
+        if [ "$res" = "PASS" ]; then
+            printf " Iteration %2d / %-2d:  ${COLOR_GREEN}PASS${COLOR_RESET}  (%4.1fs)\n" "$i" "$NUM_ITERATIONS" "$dur"
+        else
+            printf " Iteration %2d / %-2d:  ${COLOR_RED}FAIL${COLOR_RESET}  (%4.1fs, rc=%s)\n" "$i" "$NUM_ITERATIONS" "$dur" "$res"
+        fi
+    done
+    echo -e "${COLOR_BOLD}--------------------------------------------------------------------------------${COLOR_RESET}"
+    if [ "$FAILED_COUNT" -eq 0 ] && [ "$completed" -eq "$NUM_ITERATIONS" ]; then
+        echo -e " Result: ${COLOR_GREEN}ALL $NUM_ITERATIONS ITERATIONS PASSED!${COLOR_RESET} (Total: ${total_min}m ${total_sec}s)"
+    elif [ "$FAILED_COUNT" -eq 0 ]; then
+        echo -e " Result: ${COLOR_YELLOW}$PASSED_COUNT / $completed PASSED (Interrupted)${COLOR_RESET} (Total: ${total_min}m ${total_sec}s)"
+    else
+        echo -e " Result: ${COLOR_RED}$FAILED_COUNT / $completed FAILED ($PASSED_COUNT passed)${COLOR_RESET} (Total: ${total_min}m ${total_sec}s)"
+    fi
+    echo -e "${COLOR_BOLD}================================================================================${COLOR_RESET}"
+}
+
+for ((i=1; i<=NUM_ITERATIONS; i++)); do
+    echo -e "\n${COLOR_BOLD}>>> [Iteration $i / $NUM_ITERATIONS] Starting: $(date +'%Y-%m-%d %H:%M:%S') <<<${COLOR_RESET}"
+    START_TIME=$(date +%s.%N)
+
+    # Run the test command
+    RC=0
+    "$OVM_TEST" "${TEST_ARGS[@]}" || RC=$?
+    END_TIME=$(date +%s.%N)
+    DURATION=$(awk "BEGIN {printf \"%.1f\", $END_TIME - $START_TIME}")
+    DURATIONS+=("$DURATION")
+
+    if [ "$RC" -eq 0 ]; then
+        RESULTS+=("PASS")
+        ((PASSED_COUNT++)) || true
+        echo -e "${COLOR_GREEN}[+] Iteration $i PASSED in ${DURATION}s${COLOR_RESET}"
+    else
+        RESULTS+=("$RC")
+        ((FAILED_COUNT++)) || true
+        echo -e "${COLOR_RED}[-] Iteration $i FAILED (exit code $RC) after ${DURATION}s${COLOR_RESET}"
+        if [ "$STOP_ON_FAIL" = true ]; then
+            echo -e "${COLOR_RED}[!] Stopping loop early due to failure on iteration $i (-e / --stop-on-fail).${COLOR_RESET}"
+            break
+        fi
+    fi
+done
+
+print_summary
+
+if [ "$FAILED_COUNT" -gt 0 ]; then
+    exit 1
+fi
+exit 0

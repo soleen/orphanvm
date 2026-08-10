@@ -1,0 +1,128 @@
+#!/bin/sh
+
+show_usage() {
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Launch OrphanVM guest VM using QEMU."
+    echo ""
+    echo "Options:"
+    echo "  -m, --memory MEM       Guest RAM size (default: 128M)"
+    echo "  -c, --cpus CPUS        Number of guest vCPUs (default: 1)"
+    echo "  -h, --help             Show this help message"
+}
+
+MEM_SIZE="${MEM_SIZE:-128M}"
+VCPUS="${VCPUS:-1}"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -m|--memory)
+            MEM_SIZE="$2"
+            shift 2
+            ;;
+        -c|--cpus)
+            VCPUS="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        *)
+            echo "Error: Unknown argument '$1'" >&2
+            show_usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Check if we are running inside the Host VM
+if [ -d "/opt/guest" ] && [ -f "/opt/guest/kernel" ]; then
+    KERNEL="/opt/guest/kernel"
+    INITRD=$(ls /opt/guest/rootfs.cpio* 2>/dev/null | head -n 1)
+else
+    BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+    case "$BIN_DIR" in
+        *output_*)
+            OUT_DIR="$(cd "$BIN_DIR/.." && pwd)"
+            ;;
+        *)
+            PROJECT_ROOT="$(cd "$BIN_DIR/.." && pwd)"
+            TARGET_ARCH="${ARCH:-$(uname -m)}"
+            if [ "$TARGET_ARCH" = "aarch64" ] || [ "$TARGET_ARCH" = "arm64" ]; then
+                OUT_DIR="$PROJECT_ROOT/output_arm64"
+            else
+                OUT_DIR="$PROJECT_ROOT/output_x86_64"
+            fi
+            ;;
+    esac
+    INITRD="$OUT_DIR/buildroot_guest/images/rootfs.cpio.lz4"
+    case "$OUT_DIR" in
+        *arm64*)
+            KERNEL="$OUT_DIR/linux_guest/arch/arm64/boot/Image"
+            ;;
+        *)
+            KERNEL="$OUT_DIR/linux_guest/arch/x86/boot/bzImage"
+            ;;
+    esac
+fi
+
+if [ -z "$KERNEL" ] || [ ! -f "$KERNEL" ]; then
+    echo "Error: Guest kernel image not found at $KERNEL." >&2
+    exit 1
+fi
+
+if [ ! -f "$INITRD" ]; then
+    echo "Error: Guest initramfs image not found at $INITRD." >&2
+    exit 1
+fi
+
+ARCH=$(uname -m)
+if [ "$ARCH" = "aarch64" ]; then
+    QEMU_BIN="qemu-system-aarch64"
+    MACHINE="-machine virt,gic-version=3"
+    CONSOLE="ttyAMA0"
+else
+    QEMU_BIN="qemu-system-x86_64"
+    MACHINE="-machine q35"
+    CONSOLE="ttyS0"
+fi
+
+if ! command -v "$QEMU_BIN" >/dev/null 2>&1; then
+    echo "Error: $QEMU_BIN is not installed." >&2
+    exit 1
+fi
+
+LOG_FILE="${LOG_FILE:-/tmp/qemu_guest.log}"
+
+USE_KVM=false
+if [ -w /dev/kvm ]; then
+    if timeout 1 "$QEMU_BIN" -accel kvm -M none >/dev/null 2>&1; then
+        USE_KVM=true
+    fi
+fi
+
+if [ "$USE_KVM" = true ]; then
+    ACCEL_OPTS="-enable-kvm -cpu host"
+    echo "Launching QEMU (with KVM hardware acceleration)..."
+else
+    ACCEL_OPTS="-accel tcg -cpu max"
+    echo "Launching QEMU (with TCG software emulation)..."
+fi
+echo "Kernel:  $KERNEL"
+echo "Initrd:  $INITRD"
+echo "Console: $CONSOLE"
+echo "--------------------------------------------------------"
+
+STDBUF_CMD="stdbuf -oL -eL"
+if ! command -v stdbuf >/dev/null 2>&1; then
+    STDBUF_CMD=""
+fi
+
+echo "Launching QEMU in background (logging to $LOG_FILE)..."
+( trap '' HUP; $STDBUF_CMD "$QEMU_BIN" $ACCEL_OPTS $MACHINE -m "$MEM_SIZE" -smp "$VCPUS" \
+    -kernel "$KERNEL" \
+    -initrd "$INITRD" \
+    -append "console=$CONSOLE panic=1 default_hugepagesz=2M hugepages=8" \
+    -display none -serial stdio > "$LOG_FILE" 2>&1 ) &
+echo "QEMU background PID: $!. View logs with: tail -f $LOG_FILE"

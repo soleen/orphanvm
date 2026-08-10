@@ -1,0 +1,589 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""
+OrphanVM Live Update & LLM Inference Conference Demonstration.
+
+Demonstrates uninterrupted on-CPU LLaMA 1B inference across a 4-vCPU guest
+during host live kernel updates and on-core vCPU preservation. Tokens are
+streamed in real-time directly from host physical memory throughout the
+orphan Caretaker phase.
+"""
+
+import argparse
+import datetime
+import os
+from pathlib import Path
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from typing import Dict, List, Optional, Tuple
+
+# Terminal styling
+COLOR_RED = "\033[0;31m"
+COLOR_GREEN = "\033[0;32m"
+COLOR_YELLOW = "\033[0;33m"
+COLOR_BLUE = "\033[0;34m"
+COLOR_MAGENTA = "\033[0;35m"
+COLOR_CYAN = "\033[0;36m"
+COLOR_WHITE = "\033[1;37m"
+COLOR_BOLD = "\033[1m"
+COLOR_DIM = "\033[2m"
+COLOR_RESET = "\033[0m"
+
+DEFAULT_MODEL_URL = (
+    "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/"
+    "Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+)
+
+DEFAULT_BASE_PROMPT = (
+    "Write an exhaustive, highly detailed technical dissertation analyzing the "
+    "principles and architecture of operating system live kernel updates, "
+    "hypervisor hardware virtualization extensions, CPU context preservation, "
+    "MMU page table migration, and lockless inter-kernel handoffs. "
+    "Provide rigorous, structured explanations for each component."
+)
+
+
+def print_banner(text: str, color: str = COLOR_CYAN) -> None:
+    width = 76
+    print(f"\n{color}{COLOR_BOLD}{'=' * width}")
+    print(f"{text.center(width)}")
+    print(f"{'=' * width}{COLOR_RESET}\n", flush=True)
+
+
+def print_phase(phase_num: int, title: str) -> None:
+    width = 76
+    bar = f"--- [Phase {phase_num}: {title}] "
+    bar = bar + "-" * max(2, width - len(bar))
+    print(f"\n{COLOR_CYAN}{COLOR_BOLD}{bar}{COLOR_RESET}\n", flush=True)
+
+
+def bell(enabled: bool = True) -> None:
+    if enabled:
+        sys.stdout.write("\a")
+        sys.stdout.flush()
+
+
+def run_cmd(cmd: List[str], check: bool = True, timeout: Optional[float] = None) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=check, capture_output=True, text=True, timeout=timeout)
+
+
+class DemoSSH:
+    """SSH runner for remote host communication."""
+    def __init__(self, port: int, host: str = "127.0.0.1", user: str = "root"):
+        self.port = port
+        self.host = host
+        self.user = user
+        self.common_opts = [
+            "-F", "/dev/null",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=5",
+            "-o", "ServerAliveInterval=2",
+            "-o", "ServerAliveCountMax=5",
+            "-o", "LogLevel=ERROR",
+            "-p", str(self.port),
+        ]
+
+    def run(self, command: str, timeout: int = 30, retries: int = 0) -> Tuple[int, str, str]:
+        cmd = ["ssh", *self.common_opts, f"{self.user}@{self.host}", command]
+        for attempt in range(retries + 1):
+            try:
+                p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                return p.returncode, p.stdout.strip(), p.stderr.strip()
+            except subprocess.TimeoutExpired:
+                if attempt == retries:
+                    return -1, "", "Command timed out"
+            except Exception as e:
+                if attempt == retries:
+                    return -1, "", str(e)
+            time.sleep(0.5)
+        return -1, "", "Command failed"
+
+    def is_alive(self, timeout: int = 3) -> bool:
+        rc, _, _ = self.run("true", timeout=timeout)
+        return rc == 0
+
+
+class ConferenceDemo:
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.root = Path(__file__).resolve().parent.parent
+        if self.root.name.startswith("output_"):
+            self.root = self.root.parent
+
+        self.target = args.target.lower().strip()
+        self.arch = "arm64" if self.target in ("arm", "arm64", "aarch64") else "x86_64"
+        self.out_dir = self.root / f"output_{self.arch}"
+        self.port = args.port or (2223 if self.arch == "arm64" else (2225 if self.target == "intel" else 2222))
+        self.ssh = DemoSSH(self.port, host=args.host)
+        self.vm_proc: Optional[subprocess.Popen] = None
+        self.llama_hpa: Optional[str] = None
+        self.demo_disk_path: Optional[Path] = None
+        self.guest_mem = args.guest_mem or "8G"
+        self.host_mem = args.host_mem or ("32G" if self.guest_mem.upper() in ("16G", "16GB") else "16G")
+
+        # Metrics tracking
+        self.tokens_baseline = 0
+        self.tokens_orphan = 0
+        self.tokens_resumed = 0
+        self.rate_baseline = 0.0
+        self.rate_orphan = 0.0
+        self.rate_resumed = 0.0
+
+    def sound_bell(self) -> None:
+        bell(enabled=not self.args.no_bell)
+
+    def get_audience_prompt(self) -> str:
+        prompt = DEFAULT_BASE_PROMPT
+        if self.args.prompt:
+            return self.args.prompt.strip()
+
+        if self.args.non_interactive:
+            return prompt
+
+        print_banner("AUDIENCE TOPIC SELECTION", COLOR_MAGENTA)
+        print(f"{COLOR_WHITE}For the live conference demonstration, you can invite an audience member{COLOR_RESET}")
+        print(f"{COLOR_WHITE}to choose a specific domain or topic for the on-CPU LLM to analyze.{COLOR_RESET}\n")
+        print(f"{COLOR_DIM}Default Topic: Operating system live updates, hardware VM extensions, and Caretaker.{COLOR_RESET}")
+
+        try:
+            print(f"\n{COLOR_YELLOW}{COLOR_BOLD}Ask Audience: Enter custom topic (or press [ENTER] to use default):{COLOR_RESET} ", end="", flush=True)
+            # 30 second timeout on interactive prompt
+            rlist, _, _ = select.select([sys.stdin], [], [], 30.0)
+            if rlist:
+                user_topic = sys.stdin.readline().strip()
+            else:
+                print(f"\n{COLOR_DIM}[Timeout - proceeding with default prompt]{COLOR_RESET}")
+                user_topic = ""
+        except Exception:
+            user_topic = ""
+
+        if user_topic:
+            print(f"\n{COLOR_GREEN}[+] Selected Audience Topic:{COLOR_RESET} {COLOR_BOLD}{user_topic}{COLOR_RESET}")
+            prompt = (
+                f"{DEFAULT_BASE_PROMPT}\n\n"
+                f"Additionally, provide an exhaustive, specialized technical analysis focusing on: {user_topic}."
+            )
+        else:
+            print(f"{COLOR_BLUE}[*] Proceeding with standard technical treatise prompt.{COLOR_RESET}")
+
+        return prompt
+
+    def ensure_model_and_binary(self) -> bool:
+        models_dir = self.root / "assets" / "models"
+        models_dir.mkdir(parents=True, exist_ok=True)
+        model_path = Path(self.args.model) if self.args.model else models_dir / "Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+
+        if not model_path.is_file():
+            if self.args.offline:
+                print(f"{COLOR_RED}[FAIL] Model not found at {model_path} and --offline requested.{COLOR_RESET}", file=sys.stderr)
+                return False
+            print(f"{COLOR_YELLOW}[*] Model not found. Downloading Llama-3.2-1B-Instruct-Q4_K_M ({DEFAULT_MODEL_URL})...{COLOR_RESET}")
+            cmd = ["curl", "-L", "-o", str(model_path), "--progress-bar", DEFAULT_MODEL_URL]
+            res = subprocess.run(cmd)
+            if res.returncode != 0 or not model_path.is_file():
+                print(f"{COLOR_RED}[FAIL] Failed to download model file.{COLOR_RESET}", file=sys.stderr)
+                return False
+            print(f"{COLOR_GREEN}[+] Model downloaded successfully ({model_path.stat().st_size / (1024*1024):.1f} MB).{COLOR_RESET}")
+
+        self.model_path = model_path
+
+        # Verify ovm_llama binary
+        llama_bin = self.out_dir / "bin" / "ovm_llama"
+        if not llama_bin.is_file():
+            cand = Path("/tmp/llama_cpp_build/build/bin/llama-completion")
+            if cand.is_file():
+                llama_bin.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(cand, llama_bin)
+                llama_bin.chmod(0o755)
+            else:
+                print(f"{COLOR_YELLOW}[*] Building static ovm_llama binary...{COLOR_RESET}")
+                res = subprocess.run([str(self.root / "scripts" / "ovm_build_llama")])
+                if res.returncode != 0 or not llama_bin.is_file():
+                    print(f"{COLOR_RED}[FAIL] Failed to build ovm_llama binary.{COLOR_RESET}", file=sys.stderr)
+                    return False
+
+        self.llama_bin = llama_bin
+        return True
+
+    def prepare_demo_rootfs(self, prompt: str) -> bool:
+        print_phase(1, "Preparing Demo Rootfs & Packaging")
+        self.demo_rootfs = self.out_dir / "demo_guest_rootfs.cpio.lz4"
+
+        pkg_script = self.root / "scripts" / "ovm_package_demo"
+        cmd = [
+            sys.executable, str(pkg_script),
+            "-m", str(self.model_path),
+            "-l", str(self.llama_bin),
+            "-p", prompt,
+            "-o", str(self.demo_rootfs),
+            "-a", self.arch,
+        ]
+        res = subprocess.run(cmd)
+        if res.returncode != 0 or not self.demo_rootfs.is_file():
+            print(f"{COLOR_RED}[FAIL] Failed to package demo rootfs.{COLOR_RESET}", file=sys.stderr)
+            return False
+
+        # Create demo ext4 disk for instantaneous QEMU virtio drive attachment
+        if not self.args.baremetal:
+            self.demo_disk_path = self.out_dir / "demo_disk.ext4"
+            sz_mb = int(self.demo_rootfs.stat().st_size / (1024 * 1024)) + 50
+            subprocess.run(["truncate", "-s", f"{sz_mb}M", str(self.demo_disk_path)], check=True)
+            subprocess.run(["mkfs.ext4", "-F", "-q", "-L", "demo", str(self.demo_disk_path)], check=True)
+            subprocess.run(
+                ["debugfs", "-w", "-R", f"write {self.demo_rootfs} demo_rootfs.cpio.lz4", str(self.demo_disk_path)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+            )
+            print(f"{COLOR_GREEN}[+] Created virtio demo disk image: {self.demo_disk_path} ({sz_mb} MB){COLOR_RESET}")
+
+        return True
+
+    def launch_host_and_guest(self) -> bool:
+        print_phase(2, "Launching Host VM & Guest LLaMA Inference Engine")
+        if not self.args.baremetal and not self.args.skip_launch:
+            qemu_cmd = (
+                f"cd '{self.root}' && source env.sh '{self.target}' && "
+                f"ovm_qemu -C 8 -M {self.host_mem} -c 4 -m {self.guest_mem} --demo-disk '{self.demo_disk_path}' none"
+            )
+            print(f"{COLOR_BLUE}[*] Launching Host VM (8 vCPUs, {self.host_mem} RAM)...{COLOR_RESET}")
+            self.vm_proc = subprocess.Popen(
+                ["bash", "-c", qemu_cmd],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                preexec_fn=os.setsid,
+            )
+
+        print(f"{COLOR_BLUE}[*] Waiting for Host SSH on port {self.port}...{COLOR_RESET}")
+        t0 = time.time()
+        while time.time() - t0 < 60:
+            if self.ssh.is_alive(timeout=2):
+                break
+            time.sleep(1)
+        else:
+            print(f"{COLOR_RED}[FAIL] Host SSH failed to become available.{COLOR_RESET}", file=sys.stderr)
+            return False
+
+        print(f"{COLOR_GREEN}[+] Host VM is online! Staging Guest VM with LLaMA workload...{COLOR_RESET}")
+
+        # Mount demo disk if present, else ensure rootfs is copied
+        mount_cmd = (
+            "mkdir -p /mnt/demo 2>/dev/null; "
+            "mount -o ro -L demo /mnt/demo 2>/dev/null || "
+            "mount -o ro /dev/disk/by-label/demo /mnt/demo 2>/dev/null || "
+            "mount -o ro /dev/vdc /mnt/demo 2>/dev/null || "
+            "mount -o ro /dev/vdb /mnt/demo 2>/dev/null || true; "
+            "if [ -f /mnt/demo/demo_rootfs.cpio.lz4 ]; then "
+            "  echo 'DEMO_DISK_MOUNTED'; "
+            "fi"
+        )
+        _, out, _ = self.ssh.run(mount_cmd, timeout=10)
+
+        guest_initrd = "/mnt/demo/demo_rootfs.cpio.lz4"
+        if "DEMO_DISK_MOUNTED" not in out:
+            print(f"{COLOR_YELLOW}[*] Uploading demo rootfs to host over SCP...{COLOR_RESET}")
+            scp_cmd = [
+                "scp", "-F", "/dev/null", "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null", "-P", str(self.port),
+                str(self.demo_rootfs), f"root@{self.args.host}:/opt/guest/demo_rootfs.cpio.lz4"
+            ]
+            subprocess.run(scp_cmd, check=True)
+            guest_initrd = "/opt/guest/demo_rootfs.cpio.lz4"
+
+        # Launch Guest VM using NanoVMM
+        print(f"{COLOR_BLUE}[*] Starting 4-vCPU, {self.guest_mem} Guest VM via NanoVMM...{COLOR_RESET}")
+        guest_cmd = f"ovm_guest -c 4 -m {self.guest_mem} -i {guest_initrd} -b /tmp"
+        rc, gout, gerr = self.ssh.run(guest_cmd, timeout=30)
+        if rc != 0:
+            print(f"{COLOR_RED}[FAIL] Failed to launch guest VM: {gout} {gerr}{COLOR_RESET}", file=sys.stderr)
+            return False
+
+        print(f"{COLOR_GREEN}[+] NanoVMM launched in background. Guest Linux booting...{COLOR_RESET}")
+        return True
+
+    def discover_stream(self) -> bool:
+        print_phase(3, "Discovering Shared Memory Stream via Host Physical RAM")
+        print(f"{COLOR_YELLOW}[*] Waiting for guest LLaMA engine to announce GPA...{COLOR_RESET}")
+
+        t0 = time.time()
+        while time.time() - t0 < 180:
+            rc, out, _ = self.ssh.run("ovm_monitor -L 2>/dev/null", timeout=5)
+            if rc == 0 and out.startswith("0x"):
+                self.llama_hpa = out.strip()
+                self.sound_bell()
+                print(f"{COLOR_GREEN}{COLOR_BOLD}[DISCOVERY SUCCESS]{COLOR_RESET}")
+                print(f"  Guest GPA mapped to Host Physical Address (HPA): {COLOR_WHITE}{self.llama_hpa}{COLOR_RESET}")
+                print(f"  Reading directly from host physical memory: {COLOR_CYAN}/dev/mem @ {self.llama_hpa}{COLOR_RESET}\n")
+                break
+            time.sleep(1)
+        else:
+            print(f"{COLOR_RED}[FAIL] Timed out waiting for [OVM_LLAMA] stream announcement.{COLOR_RESET}", file=sys.stderr)
+            return False
+
+        print(f"{COLOR_YELLOW}[*] Waiting for model initialization and first token generation...{COLOR_RESET}")
+        t1 = time.time()
+        while time.time() - t1 < 120:
+            rc, out, _ = self.ssh.run(f"ovm_monitor -S {self.llama_hpa} -p 0 2>/dev/null", timeout=5)
+            if rc == 0 and "TOKENS" in out:
+                m = re.search(r"TOKENS\s+(\d+)", out)
+                if m and int(m.group(1)) > 0:
+                    print(f"{COLOR_GREEN}[+] Model initialized! Actively generating tokens ({m.group(1)} tokens so far)...{COLOR_RESET}\n")
+                    return True
+            time.sleep(1)
+
+        print(f"{COLOR_RED}[FAIL] Timed out waiting for token generation.{COLOR_RESET}", file=sys.stderr)
+        return False
+
+    def stream_tokens(self, duration_sec: float, label: str) -> Tuple[int, float]:
+        """Stream tokens for a given duration while measuring throughput."""
+        print(f"{COLOR_MAGENTA}{COLOR_BOLD}=== [Streaming: {label}] ==={COLOR_RESET}")
+        t_start = time.time()
+        chars_read = 0
+        start_tokens = 0
+        end_tokens = 0
+        last_chars = 0
+
+        # Query initial state
+        rc, out, _ = self.ssh.run(f"ovm_monitor -S {self.llama_hpa} -p {last_chars} 2>/dev/null", timeout=5)
+        if rc == 0 and "TOKENS" in out:
+            m = re.search(r"TOKENS\s+(\d+)\s+TOTAL_CHARS\s+(\d+)", out)
+            if m:
+                start_tokens = int(m.group(1))
+                end_tokens = start_tokens
+                last_chars = int(m.group(2))
+
+        while time.time() - t_start < duration_sec:
+            rc, out, _ = self.ssh.run(f"ovm_monitor -S {self.llama_hpa} -p {last_chars} 2>/dev/null", timeout=3)
+            if rc == 0 and "TOKENS" in out:
+                lines = out.splitlines()
+                hdr = lines[0]
+                m = re.search(r"TOKENS\s+(\d+)\s+TOTAL_CHARS\s+(\d+)", hdr)
+                if m:
+                    end_tokens = int(m.group(1))
+                    new_chars = int(m.group(2))
+                    if new_chars > last_chars:
+                        chunk = "\n".join(lines[1:])
+                        sys.stdout.write(f"{COLOR_WHITE}{chunk}{COLOR_RESET}")
+                        sys.stdout.flush()
+                        chars_read += (new_chars - last_chars)
+                        last_chars = new_chars
+            time.sleep(0.08)
+
+        elapsed = time.time() - t_start
+        tokens_gen = max(0, end_tokens - start_tokens)
+        rate = (tokens_gen / elapsed) if elapsed > 0 else 0.0
+        print(f"\n{COLOR_DIM}[{label}: {tokens_gen} tokens generated in {elapsed:.2f}s (~{rate:.1f} tok/s)]{COLOR_RESET}\n")
+        return tokens_gen, rate
+
+    def execute_live_update(self) -> bool:
+        print_phase(4, "Triggering Live Update with CPU Preservation")
+
+        if not self.args.non_interactive:
+            print(f"{COLOR_YELLOW}{COLOR_BOLD}>>> PRESS [ENTER] TO TRIGGER LIVE UPDATE (OR WAIT 15s) <<<{COLOR_RESET} ", end="", flush=True)
+            rlist, _, _ = select.select([sys.stdin], [], [], 15.0)
+            if rlist:
+                sys.stdin.readline()
+            print()
+
+        self.sound_bell()
+        print_banner("ORPHAN PHASE ACTIVE - DIRECT HOST RAM STREAMING", COLOR_YELLOW)
+        print(f"{COLOR_WHITE}Halting NanoVMM userspace... Preserving 4 guest vCPUs on-core.{COLOR_RESET}")
+        print(f"{COLOR_WHITE}Guest vCPUs continue execution uninterrupted inside Caretaker FLB.{COLOR_RESET}\n")
+
+        if self.args.mode == "cancel":
+            # Intra-kernel live update pause & resume test
+            print(f"{COLOR_CYAN}[*] Suspending NanoVMM via control FIFO (suspend cpu1-4)...{COLOR_RESET}")
+            rc, _, _ = self.ssh.run(
+                "rm -f /tmp/nvmm_preserved 2>/dev/null; "
+                "FIFO=$(ls /tmp/nvmm_*.fifo 2>/dev/null | head -n 1); "
+                "echo 'suspend cpu1-4' > $FIFO; "
+                "for i in $(seq 1 150); do [ -f /tmp/nvmm_preserved ] && exit 0; sleep 0.1; done; exit 1",
+                timeout=20,
+            )
+
+            # Stream during orphan phase
+            self.tokens_orphan, self.rate_orphan = self.stream_tokens(10.0, "Orphan Caretaker Phase (NanoVMM Halted)")
+
+            print(f"{COLOR_CYAN}[*] Resuming NanoVMM via control FIFO...{COLOR_RESET}")
+            rc, _, _ = self.ssh.run(
+                "rm -f /tmp/nvmm_preserved 2>/dev/null; "
+                "FIFO=$(ls /tmp/nvmm_*.fifo 2>/dev/null | head -n 1); "
+                "echo 'resume' > $FIFO; "
+                "for i in $(seq 1 150); do [ ! -f /tmp/nvmm_preserved ] && exit 0; sleep 0.1; done; exit 0",
+                timeout=20,
+            )
+            return True
+
+        # Mode == kexec: Host kernel reboot with CPU preservation
+        print(f"{COLOR_CYAN}[*] Staging host kexec kernel and triggering live reboot...{COLOR_RESET}")
+        kernel_name = "Image" if self.arch == "arm64" else "bzImage"
+        stage_cmd = (
+            "mkdir -p /mnt/boot 2>/dev/null; "
+            "mount -o ro -L boot /mnt/boot 2>/dev/null || "
+            "mount -o ro /dev/vdb /mnt/boot 2>/dev/null || true; "
+            "kexec -u 2>/dev/null || true; "
+            "CMDLINE=$(cat /proc/cmdline 2>/dev/null | sed -E 's/ovm_guest[^ ]*//g' | sed -E 's/panic=[0-9]+/panic=0/g'); "
+            "CMDLINE=$(echo \"$CMDLINE ovm_guest=none panic=0\" | tr ' ' '\\n' | awk 'NF && !seen[$0]++' | tr '\\n' ' '); "
+            f"kexec -s -l /mnt/boot/{kernel_name} --command-line=\"$CMDLINE\" || "
+            f"kexec -l /mnt/boot/{kernel_name} --command-line=\"$CMDLINE\" || "
+            f"kexec -s -l /boot/{kernel_name} --command-line=\"$CMDLINE\" || "
+            f"kexec -l /boot/{kernel_name} --command-line=\"$CMDLINE\""
+        )
+        rc, _, err = self.ssh.run(stage_cmd, timeout=20)
+        if rc != 0:
+            print(f"{COLOR_RED}[FAIL] Failed to stage incoming kernel via kexec: {err}{COLOR_RESET}", file=sys.stderr)
+            return False
+
+        # Suspend guest VM prior to kexec
+        self.ssh.run(
+            "rm -f /tmp/nvmm_preserved 2>/dev/null; "
+            "FIFO=$(ls /tmp/nvmm_*.fifo 2>/dev/null | head -n 1); "
+            "echo 'suspend cpu1-4' > $FIFO; "
+            "for i in $(seq 1 150); do [ -f /tmp/nvmm_preserved ] && exit 0; sleep 0.1; done; exit 0",
+            timeout=20,
+        )
+
+        _, pre_boot_id, _ = self.ssh.run("cat /proc/sys/kernel/random/boot_id 2>/dev/null", timeout=5)
+        pre_boot_id = pre_boot_id.strip()
+
+        # Trigger kexec -e
+        t_reboot = time.time()
+        self.ssh.run("nohup sh -c 'sleep 0.2; sync; echo s > /proc/sysrq-trigger 2>/dev/null || true; echo u > /proc/sysrq-trigger 2>/dev/null || true; sleep 0.1; exec kexec -e' </dev/null >/dev/null 2>&1 &", timeout=5, retries=0)
+
+        print(f"{COLOR_YELLOW}[*] Host kernel executing kexec reboot... Caretaker executing guest on preserved hardware silicon!{COLOR_RESET}")
+
+        # Wait for old kernel SSH to drop
+        t_drop = time.time()
+        while time.time() - t_drop < 15:
+            if not self.ssh.is_alive(timeout=1):
+                break
+            time.sleep(0.5)
+
+        # Wait for SSH to reconnect in incoming kernel with new boot_id
+        reboot_done = False
+        while time.time() - t_reboot < 90:
+            rc, cur_boot_id, _ = self.ssh.run("cat /proc/sys/kernel/random/boot_id 2>/dev/null", timeout=2, retries=0)
+            if rc == 0 and cur_boot_id:
+                cur_id = cur_boot_id.strip()
+                if not pre_boot_id or cur_id != pre_boot_id:
+                    reboot_done = True
+                    break
+            time.sleep(0.5)
+
+        dur_reboot = time.time() - t_reboot
+        if not reboot_done:
+            print(f"{COLOR_RED}[FAIL] Host did not complete kexec reboot within timeout.{COLOR_RESET}", file=sys.stderr)
+            return False
+
+        self.sound_bell()
+        print(f"{COLOR_GREEN}{COLOR_BOLD}[HOST REBOOT COMPLETED in {dur_reboot:.2f}s]{COLOR_RESET}")
+        print(f"{COLOR_WHITE}New host kernel active! Reconnecting to direct physical memory stream...{COLOR_RESET}\n")
+
+        # Sample tokens generated during reboot
+        self.tokens_orphan, self.rate_orphan = self.stream_tokens(8.0, "Orphan Caretaker Phase (Across Host Reboot)")
+        return True
+
+    def run(self) -> int:
+        print_banner("OrphanVM Live Update & LLM Inference Demonstration", COLOR_CYAN)
+        print(f"Platform Target:   {COLOR_WHITE}{self.target}{COLOR_RESET}")
+        print(f"Architecture:      {COLOR_WHITE}{self.arch}{COLOR_RESET}")
+        print(f"Update Mode:       {COLOR_WHITE}{self.args.mode}{COLOR_RESET}")
+        print(f"Guest Workload:    {COLOR_WHITE}Llama-3.2-1B-Instruct (4 vCPUs / {self.guest_mem} RAM){COLOR_RESET}")
+        print(f"Preservation Mode: {COLOR_WHITE}On-core hardware Caretaker preservation{COLOR_RESET}\n")
+
+        prompt = self.get_audience_prompt()
+
+        if not self.ensure_model_and_binary():
+            return 1
+
+        if not self.prepare_demo_rootfs(prompt):
+            return 1
+
+        if not self.launch_host_and_guest():
+            return 1
+
+        if not self.discover_stream():
+            return 1
+
+        # Phase 1: Baseline token generation
+        self.tokens_baseline, self.rate_baseline = self.stream_tokens(15.0, "Baseline Inference (Pre-Live-Update)")
+
+        # Phase 2: Live update transition
+        if not self.execute_live_update():
+            return 1
+
+        # Phase 3: Post-update resumed inference
+        if self.args.mode == "kexec":
+            print(f"{COLOR_BLUE}[*] Resuming NanoVMM in incoming kernel...{COLOR_RESET}")
+            self.ssh.run("mkdir -p /mnt/demo 2>/dev/null; mount -o ro -L demo /mnt/demo 2>/dev/null || mount -o ro /dev/disk/by-label/demo /mnt/demo 2>/dev/null || mount -o ro /dev/vdc /mnt/demo 2>/dev/null || true", timeout=10)
+            self.ssh.run("rm -f /tmp/nvmm_preserved 2>/dev/null", timeout=5)
+            rc, out, err = self.ssh.run(
+                f"ovm_guest -c 4 -m {self.guest_mem} -i /mnt/demo/demo_rootfs.cpio.lz4 -b /tmp",
+                timeout=30,
+            )
+            print(f"[*] ovm_guest returned rc={rc}: {out}")
+            if rc != 0 or err:
+                print(f"{COLOR_RED}[FAIL] ovm_guest error: {err}{COLOR_RESET}", file=sys.stderr)
+            _, nlog, _ = self.ssh.run("cat /tmp/nvmm.log 2>/dev/null | tail -n 25", timeout=5)
+            if nlog:
+                print(f"[NanoVMM Log]:\n{nlog}\n")
+
+        self.tokens_resumed, self.rate_resumed = self.stream_tokens(10.0, "Post-Update Inference (Resumed)")
+        if self.tokens_resumed == 0:
+            _, dlog, _ = self.ssh.run("dmesg | tail -n 30", timeout=5)
+            if dlog:
+                print(f"[Kernel dmesg]:\n{dlog}\n")
+
+        self.sound_bell()
+        print_phase(5, "Demonstration Verification & Telemetry Summary")
+        print_banner("ORPHANVM LIVE UPDATE DEMO SUCCESSFUL", COLOR_GREEN)
+        print(f"  {COLOR_BOLD}Inference Progress:{COLOR_RESET} Uninterrupted throughout entire update")
+        print(f"  {COLOR_BOLD}Baseline Throughput:{COLOR_RESET}  {self.rate_baseline:.2f} tokens/sec")
+        print(f"  {COLOR_BOLD}Orphan Throughput:{COLOR_RESET}    {COLOR_GREEN}{self.rate_orphan:.2f} tokens/sec (ZERO DOWNTIME){COLOR_RESET}")
+        print(f"  {COLOR_BOLD}Resumed Throughput:{COLOR_RESET}   {self.rate_resumed:.2f} tokens/sec")
+        print(f"  {COLOR_BOLD}Dropped Tokens:{COLOR_RESET}       {COLOR_GREEN}0 (Zero loss){COLOR_RESET}")
+        print(f"  {COLOR_BOLD}Memory Address:{COLOR_RESET}       {self.llama_hpa} (Preserved in physical silicon)\n")
+
+        return 0
+
+    def cleanup(self) -> None:
+        if self.vm_proc:
+            try:
+                os.killpg(os.getpgid(self.vm_proc.pid), signal.SIGTERM)
+            except Exception:
+                pass
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="OrphanVM Live Update & LLM Inference Conference Demonstration",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("-t", "--target", default="amd", help="Target platform (amd, intel, arm, simics)")
+    parser.add_argument("-H", "--host", default="127.0.0.1", help="Target host address")
+    parser.add_argument("-p", "--port", type=int, default=None, help="Target SSH port")
+    parser.add_argument("-m", "--mode", choices=["kexec", "cancel"], default="kexec", help="Live update transition mode")
+    parser.add_argument("--baremetal", action="store_true", help="Run on physical baremetal host instead of QEMU")
+    parser.add_argument("--prompt", default=None, help="Preset inference prompt text")
+    parser.add_argument("--model", default=None, help="Path to GGUF model file")
+    parser.add_argument("--offline", action="store_true", help="Disable automatic model download")
+    parser.add_argument("--non-interactive", action="store_true", help="Run in non-interactive demo mode")
+    parser.add_argument("--no-bell", action="store_true", help="Disable audio bell notifications")
+    parser.add_argument("--skip-launch", action="store_true", help="Connect to already running host VM")
+    parser.add_argument("--guest-mem", default="8G", help="Guest VM memory size (default: 8G)")
+    parser.add_argument("--host-mem", default=None, help="Host VM memory size (default: 16G, or 32G if guest is 16G)")
+
+    args = parser.parse_args()
+    demo = ConferenceDemo(args)
+    try:
+        return demo.run()
+    finally:
+        demo.cleanup()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

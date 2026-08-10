@@ -1,0 +1,10 @@
+[submodule "linux"]
+	path = linux
+	url = git@github.com:soleen/linux.git
+	branch = orphanvm
+[submodule "buildroot"]
+	path = buildroot
+	url = https://github.com/buildroot/buildroot.git
+[submodule "nanovmm"]
+	path = nanovmm
+	url = git@github.com:soleen/nanovmm.git

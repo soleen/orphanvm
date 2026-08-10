@@ -1,0 +1,12 @@
+[Unit]
+Description=OrphanVM Network Setup
+After=systemd-udevd.service
+Before=dropbear.service network.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'ip link set dev eth0 up 2>/dev/null; ip link set dev enp0s2 up 2>/dev/null; ip addr add 10.0.2.15/24 dev enp0s2 2>/dev/null || ip addr add 10.0.2.15/24 dev eth0 2>/dev/null; ip route add default via 10.0.2.2 2>/dev/null; /sbin/udhcpc -b -i enp0s2 2>/dev/null || /sbin/udhcpc -b -i eth0 2>/dev/null || true'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

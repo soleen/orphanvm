@@ -1,0 +1,14 @@
+[Unit]
+Description=Mount Host NVMe Shared Kernel Folder via Virtio-FS
+DefaultDependencies=no
+Conflicts=umount.target
+Before=local-fs.target umount.target
+
+[Mount]
+What=hostfs
+Where=/mnt
+Type=virtiofs
+Options=defaults
+
+[Install]
+WantedBy=local-fs.target

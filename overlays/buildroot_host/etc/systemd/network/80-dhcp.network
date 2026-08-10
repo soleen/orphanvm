@@ -1,0 +1,15 @@
+[Match]
+Name=eth* en*
+
+[Network]
+DHCP=ipv4
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+
+[DHCPv4]
+UseHostname=no
+UseDNS=no
+UseNTP=no
+UseDomains=no
+UseRoutes=yes
+QuickAck=yes
