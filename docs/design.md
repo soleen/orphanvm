@@ -146,31 +146,21 @@ preservation are developed as companion efforts:
 
 ## 2. Architectural Overview
 
-The current design decomposes continuous vCPU execution across `kexec` into four
-layers, ordered from bottom to top:
+The OrphanVM design consists of four layers, ordered from bottom to top:
 
-```
-+-------------------------------------------------------------------+
-| Layer 4: KVM Caretaker Engine (virt/kvm/caretaker.c, arch/...)    |
-|   - Wraps preserved vCPUs as oncore_job instances                 |
-|   - Lockless cross-kernel state machine (PAUSED/RUNNING/STOPPED)  |
-|   - Arch guest entry/exit loop (Intel VMX, AMD SVM, ARM64 VHE)    |
-+-------------------------------------------------------------------+
-| Layer 3: On-Core Execution & Scheduler (kernel/liveupdate/oncore) |
-|   - Workload-agnostic session (oncore_session) & job (oncore_job) |
-|   - Cooperative / time-sliced round-robin FIFO runqueue           |
-|   - Multiplexes M jobs across N preserved physical CPUs           |
-+-------------------------------------------------------------------+
-| Layer 2: Physical CPU Preservation (kernel/liveupdate/cpu_preserve|
-|   - .text.cpu_preserved & .data.cpu_preserved outside KHO Scratch |
-|   - CPU hotplug interception & !cpu_present(cpu) SMP isolation    |
-|   - Isolated page tables (cpu_preserved_as) & stack context       |
-+-------------------------------------------------------------------+
-| Layer 1: In-RAM KVM & vCPU Preservation via LUO & KHO             |
-|   - vmfd & secondary MMU (TDP / Stage-2) folio preservation       |
-|   - vcpufd architectural state serialization (kvm_vcpu_arch_ser)  |
-+-------------------------------------------------------------------+
-```
+| Layer   | Subsystem       | Kconfig / uAPI             | Key Responsibilities                                              |
+| :------ | :-------------- | :------------------------- | :---------------------------------------------------------------- |
+| Layer 4 | `kvm/caretaker` | `CONFIG_KVM_CARETAKER`     | Wraps preserved vCPUs as `oncore_job` instances                   |
+|         |                 | `KVM_CAP_CARETAKER`        | Cross-kernel state machine (`PAUSED`/`RUNNING`/`STOPPED`)         |
+|         |                 |                            | Arch guest entry/exit loop (Intel VMX, AMD SVM, ARM64 VHE)        |
+| Layer 3 | `oncore`        | `CONFIG_LIVEUPDATE_ONCORE` | Workload-agnostic session (`oncore_session`) & job (`oncore_job`) |
+|         |                 |                            | Time-sliced round-robin FIFO runqueue                             |
+|         |                 |                            | Multiplexes $M$ jobs across $N$ preserved physical CPUs           |
+| Layer 2 | `cpu_preserve`  | `CONFIG_LIVEUPDATE_CPU`    | `.text.cpu_preserved` & `.data.cpu_preserved` outside KHO Scratch |
+|         |                 | `/sys/.../cpu<N>/preserve` | CPU hotplug interception & `!cpu_present(cpu)` SMP isolation      |
+|         |                 |                            | Isolated page tables (`cpu_preserved_as`) & stack context         |
+| Layer 1 | `kvm_luo`       | `KVM_CAP_VCPU_PRESERVE`    | `vmfd` & secondary MMU (TDP / Stage-2) KHO folio preservation     |
+|         |                 | `"kvm_vcpu_luo_v1"`        | `vcpufd` architectural state serialization (`kvm_vcpu_arch_ser`)  |
 
 This layering allows incremental upstreaming:
 
@@ -477,7 +467,7 @@ higher-level workloads such as KVM.
   that must reside in `.text.cpu_preserved`:
   - `enum oncore_exit_reason (*run_fn)(void *data, u64 deadline_ticks)`
 
-### 5.2 Cooperative / Time-Sliced Round-Robin Scheduling
+### 5.2 Time-Sliced Round-Robin Scheduling
 
 Each preserved physical CPU in an `oncore_session` executes
 `oncore_sched_cpu_worker()` / `oncore_cpu_schedule_loop()` from inside
@@ -543,7 +533,7 @@ on outgoing-kernel internal structures**. Only structures defined in
 
 - **Cross-Kernel KHO ABI (`include/linux/kho/abi/kvm.h`, `kvm_x86.h`,
   `kvm_arm64.h`)**:
-  - `struct kvm_caretaker_cb_ser`: Contains the lockless `state`
+  - `struct kvm_caretaker_cb_ser`: Contains the `state`
     (`enum kvm_caretaker_state`), the physical CPU ID (`pcpu_id`), `vcpu_id`,
     and a KHO pointer (`telemetry`) to `struct kvm_caretaker_telemetry_ser`.
   - `struct kvm_caretaker_arch_ser`: Contains `struct kvm_caretaker_cb_ser cb`
@@ -564,7 +554,7 @@ on outgoing-kernel internal structures**. Only structures defined in
   `struct kvm_caretaker_cb_ser *` (or `struct kvm_caretaker_arch_ser *`) and
   frees the raw page once the vCPU transitions to `KVM_CARETAKER_STOPPED`.
 
-### 6.2 Lockless Cross-Kernel State Machine
+### 6.2 Cross-Kernel State Machine
 
 Handoff between the preserved physical CPU (running the outgoing kernel's
 `.text.cpu_preserved` code) and the incoming kernel (running `.retrieve()` in a
