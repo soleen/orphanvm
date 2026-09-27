@@ -55,17 +55,17 @@ proof-of-concept purposes.
 
 ### 1.1 Evolution from the Initial Proposal to RFCv1
 
-The [initial design proposal](https://lore.kernel.org/all/afEwWZksU0Fw61oT@plex)
-(posted without implementation) proposed loading a standalone, userspace-supplied
-bare-metal ELF binary into KVM via a `KVM_SET_CARETAKER` ioctl. In that initial
-proposal, the Caretaker permanently interposed on the hardware VM-exit vector
-(`HOST_RIP`) throughout the VM's lifetime, acting as a fast-path shim that
-forwarded exits back to KVM via physical function pointers when attached, and
-spinning in a detached loop during `kexec`.
+The [initial design proposal][initial-proposal] (posted without implementation)
+proposed loading a standalone, userspace-supplied bare-metal ELF binary into KVM
+via a `KVM_SET_CARETAKER` ioctl. In that initial proposal, the Caretaker
+permanently interposed on the hardware VM-exit vector (`HOST_RIP`) throughout
+the VM's lifetime, acting as a fast-path shim that forwarded exits back to KVM
+via physical function pointers when attached, and spinning in a detached loop
+during `kexec`.
 
 Following upstream community feedback on that thread, the architecture was
-redesigned for the [RFCv1 patch series](https://lore.kernel.org/all/20260920193650.3373435-1-pasha.tatashin@soleen.com)
-described in this document:
+redesigned for the [RFCv1 patch series][rfcv1-series] described in this
+document:
 
 1. **Built-in vs. External Caretaker**: Instead of parsing and validating a
    userspace ELF payload, the preserved execution code is proposed to be part of
@@ -75,28 +75,28 @@ described in this document:
    untouched while the host is running normally. Hardware VM-exit vectors
    (`HOST_RIP`, `VBAR_EL2`, `HOST_CR3`) are reprogrammed to point to the
    Caretaker only at the moment the live update session enters the preservation
-   phase, and are restored to standard KVM handlers immediately upon adoption in
-   the incoming kernel.
+   phase, and are restored to standard KVM handlers upon adoption in the
+   incoming kernel or if the live update is canceled.
 3. **Layered Subsystem Decomposition**: Rather than embedding physical CPU
    offlining, page-table isolation, and scheduling inside KVM, the current
    design separates the mechanism into generic kernel subsystems (`cpu_preserve`
-   and `oncore`) that KVM (`caretaker`) consumes as a client. This keeps core CPU
-   lifecycle management in `kernel/liveupdate/` and leaves the door open for
-   future non-KVM on-core workloads (such as polling kernel drivers or isolated
-   user tasks).
-4. **Strict KHO ABI Separation**: In-kernel `vcpufd` preservation via LUO
-   (`KVM_CAP_VCPU_PRESERVE`) provides a versioned, uAPI-backed serialization
-   format (`include/linux/kho/abi/`) across `kexec`. The incoming kernel never
-   dereferences outgoing-kernel internal data structures (`struct kvm_vcpu`,
-   `struct loaded_vmcs`, etc.), allowing live updates across kernels with
-   different struct layouts or compiler configurations.
+   and `oncore`) that KVM (`caretaker`) consumes as a client. This keeps core
+   CPU lifecycle management in `kernel/liveupdate/` and leaves the door open for
+   future non-KVM on-core workloads such as isolated user tasks.
+4. **KHO ABI Separation**: In-kernel `vcpufd` preservation via LUO provides a
+   serialization format (`include/linux/kho/abi/`) across `kexec`. Generic ABI
+   versioning and compatibility across kernel versions is out of scope of this
+   design and is addressed as a separate effort (see [`[RFC PATCH 0/3]
+   liveupdate: Move to feature flags for LUO and memfd ABI
+   compatibility`][luo-abi-rfc] and the LPC session ["Live Update
+   Compatibility"][lpc-compat]).
 
 > **Note on Proposal Status:** This document describes the current design
-> corresponding to the [RFCv1 patch series](https://lore.kernel.org/all/20260920193650.3373435-1-pasha.tatashin@soleen.com).
-> Several aspects, most notably how to structure VM-exit handling and share
-> low-level code with KVM without duplicating hypervisor logic, as well as open
-> items from the initial LKML discussion, remain under active discussion and are
-> covered in [Section 7](#7-open-design-challenges-and-topics-for-further-discussion).
+> corresponding to the [RFCv1 patch series][rfcv1-series]. Several aspects, most
+> notably how to structure VM-exit handling and share low-level code with KVM
+> without duplicating hypervisor logic, as well as open items from the initial
+> LKML discussion, remain under active discussion and are covered in
+> [Section 7][section-7].
 
 ### 1.2 Memory and Device Preservation
 
@@ -106,7 +106,7 @@ the broader Live Update project, guest memory and pass-through device
 preservation are developed as companion efforts:
 
 - **Guest Memory and Base `vmfd` Preservation**:
-  The [`guest_memfd` preservation series](https://lore.kernel.org/all/20260728121138.1103610-1-tarunsahu@google.com/)
+  The [`guest_memfd` preservation series][guest-memfd-series]
   (`[PATCH v4 00/11] liveupdate: kvm: Guest_memfd preservation`) introduces
   `guest_memfd` support as well as the base KVM `vmfd` LUO preservation
   interfaces (`KVM_CAP_LUO` / `virt/kvm/kvm_luo.c`) that this design expands
@@ -117,11 +117,11 @@ preservation are developed as companion efforts:
 - **Pass-Through Device and DMA Preservation**:
   Full pass-through device preservation across `kexec` is currently under review
   across three companion series:
-  - [PCI core support for Live Update](https://lore.kernel.org/all/20260918200640.887030-1-dmatlack@google.com/)
+  - [PCI core support for Live Update][pci-lu-series]
     (`[PATCH v9 00/13] PCI: liveupdate: PCI core support for Live Update`)
-  - [Base Live Update support for VFIO/PCI](https://lore.kernel.org/all/20260714151505.3466855-1-vipinsh@google.com/)
+  - [Base Live Update support for VFIO/PCI][vfio-lu-series]
     (`[PATCH v5 00/20] vfio/pci: Base Live Update support for VFIO`)
-  - [IOMMU live update state preservation](https://lore.kernel.org/all/20260921004834.2601285-1-skhawaja@google.com/#t)
+  - [IOMMU live update state preservation][iommu-lu-series]
     (`[PATCH v5 00/18] iommu: Add live update state preservation`)
 - **Missing Piece: Posted Interrupt Table Preservation**:
   Combined with preserved Stage-2/TDP page tables, the PCI, VFIO, and IOMMU
@@ -218,12 +218,12 @@ KVM and LUO file-descriptor preservation ioctls:
 
 ## 3. Layer 1: In-RAM vCPU and Secondary MMU Preservation via LUO
 
-Before a vCPU can execute across `kexec` (or even be suspended and resumed in RAM
-without physical CPU preservation), both its architectural register state and the
-VM's secondary page tables must survive the reboot in KHO-preserved memory. This
-layer expands upon the base KVM `vmfd` preservation infrastructure
-(`KVM_CAP_LUO` in `virt/kvm/kvm_luo.c`) introduced by the
-[`guest_memfd` preservation series](https://lore.kernel.org/all/20260728121138.1103610-1-tarunsahu@google.com/).
+Before a vCPU can execute across `kexec` (or even be suspended and resumed in
+RAM without physical CPU preservation), both its architectural register state
+and the VM's secondary page tables must survive the reboot in KHO-preserved
+memory. This layer expands upon the base KVM `vmfd` preservation infrastructure
+(`KVM_CAP_LUO` in `virt/kvm/kvm_luo.c`) introduced by the [`guest_memfd`
+preservation series][guest-memfd-series].
 
 ### 3.1 In-Kernel `vcpufd` Preservation (`KVM_CAP_VCPU_PRESERVE`)
 
@@ -657,23 +657,21 @@ ABI struct and exposes it under
 
 ## 7. Open Design Challenges and Topics for Further Discussion
 
-While the [RFCv1 patch series](https://lore.kernel.org/all/20260920193650.3373435-1-pasha.tatashin@soleen.com)
-demonstrates end-to-end continuous vCPU execution across `kexec` on Intel VMX,
-AMD SVM, and ARM64 VHE, it is an initial proof-of-concept. Several architectural
-questions, both from the [initial proposal discussion](https://lore.kernel.org/all/afEwWZksU0Fw61oT@plex)
-and from prototyping RFCv1, still need to be addressed or discussed further with
-upstream maintainers.
+While the [RFCv1 patch series][rfcv1-series] demonstrates end-to-end continuous
+vCPU execution across `kexec` on Intel VMX, AMD SVM, and ARM64 VHE, it is an
+initial proof-of-concept. Several architectural questions, both from the
+[initial proposal discussion][initial-proposal] and from prototyping RFCv1,
+still need to be addressed or discussed further with upstream maintainers.
 
 ### 7.1 VM-Exit Handling Strategy and Sharing Code with KVM
 
 A central open design question is how the Caretaker should enter the guest and
 handle VM-exits without duplicating KVM into a second in-kernel hypervisor.
 
-In the [initial LKML discussion](https://lore.kernel.org/all/afEwWZksU0Fw61oT@plex),
-Paolo Bonzini noted that the Caretaker is the non-preemptible inner part of
-`vcpu_enter_guest()`, and that `vmx_exit_handlers_fastpath()` /
-`svm_exit_handlers_fastpath()` already provide a blueprint for exits that can
-be handled with interrupts disabled.
+In the [initial LKML discussion][initial-proposal], Paolo Bonzini noted that the
+Caretaker is the non-preemptible inner part of `vcpu_enter_guest()`, and that
+`vmx_exit_handlers_fastpath()` / `svm_exit_handlers_fastpath()` already provide
+a blueprint for exits that can be handled with interrupts disabled.
 
 #### Specific VM-Exits Are Not Architectural (Zero-Exit Baseline)
 
@@ -797,7 +795,7 @@ isolation safety. The primary options under consideration are:
 
 ### 7.2 Unresolved Items from the Initial LKML Discussion
 
-Several points raised during the [initial proposal discussion](https://lore.kernel.org/all/afEwWZksU0Fw61oT@plex)
+Several points raised during the [initial proposal discussion][initial-proposal]
 were either deferred in RFCv1 or implemented differently and warrant further
 discussion:
 
@@ -1091,3 +1089,13 @@ executing across a `kexec` reboot without a virtual machine:
      - Once the incoming kernel boots and re-attaches the preserved process/task
        context via LUO, the new kernel services the pending `syscall` or page
        fault through its standard handlers and resumes the process.
+
+[initial-proposal]: https://lore.kernel.org/all/afEwWZksU0Fw61oT@plex
+[rfcv1-series]: https://lore.kernel.org/all/20260920193650.3373435-1-pasha.tatashin@soleen.com
+[luo-abi-rfc]: https://lore.kernel.org/kexec/20260903023452.721732-1-loganodell@google.com
+[lpc-compat]: https://lpc.events/event/20/contributions/2613
+[section-7]: #7-open-design-challenges-and-topics-for-further-discussion
+[guest-memfd-series]: https://lore.kernel.org/all/20260728121138.1103610-1-tarunsahu@google.com/
+[pci-lu-series]: https://lore.kernel.org/all/20260918200640.887030-1-dmatlack@google.com/
+[vfio-lu-series]: https://lore.kernel.org/all/20260714151505.3466855-1-vipinsh@google.com/
+[iommu-lu-series]: https://lore.kernel.org/all/20260921004834.2601285-1-skhawaja@google.com/#t
