@@ -445,22 +445,20 @@ are placed in dedicated linker sections:
 - `.text.cpu_preserved` (`__cpu_preserved_text`)
 - `.data.cpu_preserved` (`__cpu_preserved_data`)
 
-Translation units targeting these sections are compiled with strict flags to
-prevent implicit dependencies on the host kernel runtime:
+Functions and translation units targeting these sections use function attributes
+and compiler flags that prevent implicit dependencies on the host kernel
+runtime, enforced at build time by `objtool` and `modpost`:
 
-- `-fno-stack-protector` (no `%gs:0x28` or `sp_el0` stack canary references)
-- `-fno-jump-tables` (prevents switch statements from generating jump tables in
-  standard `.rodata` outside `.text.cpu_preserved`)
-- `-ftrivial-auto-var-init=uninitialized` (prevents compiler-synthesized pattern
-  initialization calls)
-- `-mbranch-protection=none` on ARM64
-- Disabled instrumentation (`KCOV_INSTRUMENT_<obj>.o := n`,
-  `KCSAN_SANITIZE_<obj>.o := n`, `KASAN_SANITIZE_<obj>.o := n`,
-  `UBSAN_SANITIZE_<obj>.o := n`, and
-  `CFLAGS_REMOVE_<obj>.o = $(CC_FLAGS_FTRACE)`)
-- `objtool` exemptions for `.text.cpu_preserved` from retpoline and return-thunk
-  rewriting (`__x86_indirect_thunk_*` / `__x86_return_thunk`), because those
-  thunks reside in standard `.text` and are overwritten during `kexec`.
+| Mechanism                                               | Scope        | Purpose                                                                     |
+| :------------------------------------------------------ | :----------- | :-------------------------------------------------------------------------- |
+| `__noinstr_section(".text.cpu_preserved")`              | Function     | Disables `ftrace`, KASAN, KCSAN, KMSAN, KCOV, and GCOV per function         |
+| `__no_stack_protector`, `__noscs`                       | Function     | Prevents stack-canary (`%gs:0x28` / `sp_el0`) and Shadow Call Stack (`x18`) |
+| `indirect_branch("keep")`, `function_return("keep")`    | Function     | Emits raw indirect branches/returns on x86 instead of `.text` thunks        |
+| `-fno-jump-tables`                                      | Compiler TU  | Prevents `switch` statements from emitting jump tables in `.rodata`         |
+| `-ftrivial-auto-var-init=uninitialized`                 | Compiler TU  | Prevents compiler-synthesized `memset()` calls for stack locals             |
+| `$(DISABLE_KSTACK_ERASE)`, `-DDISABLE_BRANCH_PROFILING` | Compiler TU  | Prevents `stackleak_track_stack()` and `ftrace_likely_update()` calls       |
+| `-mbranch-protection=none`                              | Compiler TU  | Disables PAC/BTI instructions in preserved ARM64 code                       |
+| `objtool` & `modpost` section checks                    | Build / Link | Rejects calls or relocations to symbols outside `.cpu_preserved` sections   |
 
 #### Relocating Outside KHO Scratch Memory
 

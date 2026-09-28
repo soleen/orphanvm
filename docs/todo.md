@@ -144,6 +144,26 @@ passed to `kho_preserve_folio()` during `LIVEUPDATE_SESSION_PRESERVE_FD(vmfd)`
     `mmu_lock`) + `kho_preserve_folio()` (outside `mmu_lock`) pattern on both
     x86 and ARM64.
 
+## 8. Clean Up `__cpu_preserved_text` Attributes and `Makefile` Flags
+
+Currently, `kernel/liveupdate/Makefile`, `arch/x86/kvm/Makefile`, and
+`arch/arm64/kvm/Makefile` duplicate `-fno-stack-protector` and per-file
+`KASAN`/`KCSAN`/`UBSAN`/`KCOV`/`FTRACE` disables across mixed `.c` files while
+missing several kernel hardening flags used by `arch/arm64/kvm/hyp/nvhe` and
+`arch/x86/purgatory`:
+
+- Define `__cpu_preserved_text` in `include/linux/cpu_preserve.h` using
+  `__noinstr_section(".text.cpu_preserved")`, `__no_stack_protector`, and
+  `__noscs` so per-function attributes handle `notrace`, KASAN, KCSAN, KMSAN,
+  KCOV, GCOV, stack protector, and Shadow Call Stack without stripping
+  instrumentation from normal host kernel functions in the same file.
+- Remove redundant `-fno-stack-protector` from the `Makefile` rules and add
+  `$(DISABLE_KSTACK_ERASE)` (to prevent `CONFIG_GCC_PLUGIN_STACKLEAK` from
+  inserting `stackleak_track_stack()` calls), `-DDISABLE_BRANCH_PROFILING` (to
+  prevent `CONFIG_TRACE_BRANCH_PROFILING` from emitting `ftrace_likely_update()`
+  calls), `GCOV_PROFILE_<obj>.o := n`, and `KMSAN_SANITIZE_<obj>.o := n`
+  alongside `-fno-jump-tables` and `-ftrivial-auto-var-init=uninitialized`.
+
 ---
 
 ## Already Implemented Since RFCv1
