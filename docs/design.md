@@ -889,9 +889,12 @@ to return the vCPU to host KVM:
 
 ### 6.3 KVM Caretaker Arch Backends
 
-Each architecture implements `struct kvm_caretaker_ops` in
-`.text.cpu_preserved` to manage guest entry/exit, quantum timers, and state
-serialization:
+The outermost Caretaker execution loop is `kvm_caretaker_vcpu_run()` (called
+from the `oncore` job callback `kvm_arch_vcpu_caretaker_run()`), which arms the
+quantum timer, repeatedly enters the guest (`ops->enter_guest()`), and handles
+VM-exits via `kvm_caretaker_handle_exit()` (`ops->decode_exit()` and
+`ops->handle_arch_exit()`). Each architecture implements
+`struct kvm_caretaker_ops` in `.text.cpu_preserved`:
 
 - **x86 Common**:
   Sets up standalone GDT, TSS, and IDT tables so host-mode exceptions and
@@ -915,7 +918,45 @@ serialization:
   interface registers, and the virtual timer, and uses the EL2 physical timer
   (`CNTHP_CVAL_EL2`) for quantum deadlines.
 
-### 6.4 Gap Telemetry and Observability
+### 6.4 Example VM-Exits Implemented in RFCv1
+
+While the initial upstream landing should not implement any guest VM-exit
+emulation (stalling on any synchronous VM-exit until the incoming kernel
+reclaims the vCPU, as discussed in Section 7.1), RFCv1 implements a small set
+of example VM-exit handlers for proof-of-concept testing.
+
+#### VM-Exit Handling Call Stack
+
+```
+cpu_preserved_park_loop()                        [Layer 1: CPU Park Loop]
+  -> oncore_cpu_schedule_loop()                  [Layer 2: Quantum Loop]
+    -> kvm_arch_vcpu_caretaker_run()             [Layer 3: Job Callback]
+      -> kvm_caretaker_vcpu_run()                [Layer 3: VM-Exit Loop]
+        -> ops->pre_run() / ops->arm_timer()
+        -> while (!kvm_caretaker_should_exit()):
+             kvm_caretaker_enter_guest()         [ops->enter_guest()]
+             kvm_caretaker_handle_exit()
+               -> ops->decode_exit()
+               -> kvm_caretaker_dispatch_exit()  [ops->handle_arch_exit()]
+               -> ops->advance_rip()
+        -> ops->disarm_timer() / ops->post_run()
+```
+
+#### Per-Platform VM-Exit Table in RFCv1
+
+| Exit Type       | Intel VMX               | AMD SVM               | ARM64 VHE            | Caretaker Action            |
+| :-------------- | :---------------------- | :-------------------- | :------------------- | :-------------------------- |
+| `PREEMPT_TIMER` | `PREEMPTION_TIMER`, IRQ | `INTR`, `NMI`, `INIT` | `ARM_EXCEPTION_IRQ`  | Exit quantum (`PAUSED`)     |
+| `IDLE`          | `HLT`, `PAUSE`          | `HLT`, `PAUSE`        | `WFx`, `DABT`/`IABT` | `cpu_relax()`, yield idle   |
+| `CONSOLE`       | `IO_INSTRUCTION` (COM1) | `IOIO` (COM1)         | N/A                  | Emulate 8250 UART, continue |
+| `CPUID`         | `CPUID`                 | `CPUID`               | N/A                  | Native `CPUID`, continue    |
+| `RDTSC`         | `RDTSC`                 | N/A (unintercepted)   | N/A                  | Read host `TSC`, continue   |
+| `MSR`           | `MSR_READ`, `MSR_WRITE` | `MSR`                 | N/A                  | Emulate safe MSRs or stall  |
+| `INSN_STEP`     | N/A                     | `INVD`, `WBINVD`      | N/A                  | Advance `RIP`, continue     |
+| `CROSS_VCPU`    | Silicon (`IPIv`)        | Stalls                | `SYS64` (`ICC_SGI*`) | Inject SGI, kick target CPU |
+| `UNHANDLED`     | `EPT_VIOLATION`, etc.   | `NPF`, `VMMCALL`      | Other `ESR_EL2` traps| Leave `PC`, return `STALL`  |
+
+### 6.5 Gap Telemetry and Observability
 
 Because standard host tracing (`ftrace`, `perf`, `bpf`) cannot run on isolated
 CPUs during `kexec`, `struct kvm_caretaker_telemetry_ser` in the KHO ABI
