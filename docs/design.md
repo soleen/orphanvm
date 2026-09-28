@@ -460,32 +460,16 @@ runtime, enforced at build time by `objtool` and `modpost`:
 | `-mbranch-protection=none`                              | Compiler TU  | Disables PAC/BTI instructions in preserved ARM64 code                       |
 | `objtool` & `modpost` section checks                    | Build / Link | Rejects calls or relocations to symbols outside `.cpu_preserved` sections   |
 
-#### Relocating Outside KHO Scratch Memory
-
-A hazard with KHO is that the compiled kernel image itself resides in physical
-memory that KHO designates as **KHO Scratch** (memory that the incoming kernel
-is permitted to overwrite during early boot decompression and initialization).
-Consequently, preserving the physical pages of the outgoing kernel's
-`.text.cpu_preserved` section in-place is unsafe.
-
-To solve this, when initializing the preserved runtime buffer
-(`cpu_preserved_init_runtime_buffer()`), `cpu_preserve`:
-
-1. Allocates physical pages from the buddy allocator (`alloc_pages()`), which
-   are guaranteed to be outside the KHO Scratch regions.
-2. Copies the compiled contents of `.text.cpu_preserved` and
-   `.data.cpu_preserved` into those newly allocated physical pages.
-3. Remaps the outgoing kernel's virtual address ranges
-   (`__cpu_preserved_text_start..__cpu_preserved_text_end` and
-   `__cpu_preserved_data_start..__cpu_preserved_data_end`) to point to the new
-   physical pages (splitting any 2MB/contpte kernel mappings into 4KB PTEs and
-   setting `PAGE_KERNEL_ROX` / `PAGE_KERNEL` permissions).
-4. Marks those physical pages as preserved in KHO (`kho_preserve_pages()`).
-
-As a result, normal C symbol references and direct calls within
-`.text.cpu_preserved` and `.data.cpu_preserved` continue to use their linked
-kernel virtual addresses, while backed by safe physical pages that survive
-`kexec`.
+Because the compiled kernel image resides in KHO scratch memory (which `kexec`
+specifically uses to load the incoming kernel and early boot allocations so
+preserved memory is not overwritten), `.text.cpu_preserved` and
+`.data.cpu_preserved` cannot be preserved in place. Instead, similar to how
+`kexec` (`relocate_kernel`) and hibernation (`swsusp_arch_resume`) copy their
+transition stubs into safe pages mapped via x86 `ident_map` or ARM64
+`trans_pgd`, `cpu_preserve` allocates KHO-preserved pages outside KHO scratch,
+copies `.text.cpu_preserved` and `.data.cpu_preserved` into them, and remaps the
+section virtual addresses to the new physical pages so linked symbol references
+continue to work across `kexec`.
 
 ### 4.2 Lifecycle and `!cpu_present(cpu)` SMP Isolation
 
