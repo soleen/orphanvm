@@ -394,110 +394,38 @@ zapping secondary page tables when `vmfd` `.preserve()` is called. By
 preserved and detached from host `KVM_RUN`, so the secondary page tables are
 quiescent.
 
-### 3.3 LUO Lifecycle: Freeze, Cancellation, Retrieve, and Finish
+### 3.3 LUO File Lifecycle (`vmfd` and `vcpufd`)
 
-Across a live update, the LUO file handlers for guest memory (`memfd_luo.c`,
-`guest_memfd_luo.c`), the VM (`kvm_luo_file_ops`), and vCPUs
-(`kvm_vcpu_luo_file_ops`) coordinate four lifecycle transitions:
+The `vmfd` (`kvm_luo_file_ops`) and `vcpufd` (`kvm_vcpu_luo_file_ops`) handlers
+implement the five `struct liveupdate_file_ops` callbacks:
 
-1. **Pre-`kexec` `.freeze()` Phase (`luo_freeze()`)**:
+| Callback        | Trigger                          | `vmfd` (`kvm_luo_*`)                                              | `vcpufd` (`kvm_vcpu_luo_*`)                                                 |
+| :-------------- | :------------------------------- | :---------------------------------------------------------------- | :-------------------------------------------------------------------------- |
+| `.preserve()`   | `LIVEUPDATE_SESSION_PRESERVE_FD` | Allocates `kvm_luo_ser` and records `KVM_CREATE_VM` `type`        | Serializes `kvm_vcpu_arch_ser` and hands off vCPU to Caretaker              |
+| `.freeze()`     | `reboot(LINUX_REBOOT_CMD_KEXEC)` | Walks quiescent secondary page tables and preserves folios in KHO | Resolves parent `ser->vm_token` via `liveupdate_get_token_outgoing()`       |
+| `.unpreserve()` | `close(session_fd)` pre-`kexec`  | Unpreserves secondary page tables (if frozen) and frees `ser`     | Detaches from Caretaker, restores state to outgoing `kvm_vcpu`, frees `ser` |
+| `.retrieve()`   | `LIVEUPDATE_SESSION_RETRIEVE_FD` | Creates new `struct kvm`; keeps old page tables until `.finish()` | Stops Caretaker vCPU, creates new `kvm_vcpu`, and restores `arch_state`     |
+| `.finish()`     | `LIVEUPDATE_SESSION_FINISH`      | Restores and frees outgoing secondary page table folios and `ser` | Stops Caretaker (if unretrieved) and frees all KHO vCPU buffers             |
+
+Two ordering properties govern how these callbacks interact:
+
+1. **Order-Independent Preservation (`.preserve()` -> `.freeze()`)**:
    Userspace can preserve `memfd`/`guest_memfd`, `vmfd`, and `vcpufd`s into a
-   LUO session in any order via `LIVEUPDATE_SESSION_PRESERVE_FD`. When
-   `reboot(LINUX_REBOOT_CMD_KEXEC)` executes, `liveupdate_reboot()` invokes
-   `luo_freeze()` across all preserved files before jumping to the incoming
-   kernel:
-   - **Guest Memory (`memfd` and `guest_memfd`)**: During `.preserve()`,
-     `memfd_luo_preserve()` freezes the shmem inode (`shmem_freeze(inode,
-     true)`) and pins and KHO-preserves its folios
-     (`memfd_luo_preserve_folios()`), while `kvm_gmem_luo_preserve()` freezes
-     the inode (`kvm_gmem_freeze(inode, true)`) and walks and KHO-preserves its
-     allocated folios (`kvm_gmem_luo_walk_folios()`) so the guest can continue
-     reading and writing existing mapped pages across `kexec`. At `.freeze()`
-     time, `memfd_luo_freeze()` snapshots the updated file position
-     (`ser->pos`), and `kvm_gmem_luo_freeze()` resolves `ser->vm_token` via
-     `liveupdate_get_token_outgoing()` to verify that the parent `vmfd` was also
-     preserved in the session.
-   - **`vmfd` (`kvm_luo_freeze()`)**: Walks the VM's quiescent secondary page
-     tables (`kvm_arch_vm_luo_freeze()`), preserves each page-table folio via
-     `kho_preserve_folio()`, and stores the resulting
-     `struct kvm_kho_folios_ser` pointer in `ser->kho_folios`.
-   - **`vcpufd` (`kvm_vcpu_luo_freeze()`)**: Resolves `ser->vm_token` via
-     `liveupdate_get_token_outgoing()` (matching `kvm_gmem_luo_freeze()`) so
-     `vcpufd` and `vmfd` can be preserved in any order during
-     `LIVEUPDATE_SESSION_PRESERVE_FD`.
-2. **Cancellation (`.unpreserve()`) Before `kexec`**:
-   If the LUO session file descriptor is closed before `kexec`
-   (`luo_session_release()` -> `luo_file_unpreserve_files()`), LUO invokes
-   `.unpreserve()` in reverse preservation order:
-   - **`vcpufd` (`kvm_vcpu_luo_unpreserve()`)**: Detaches the vCPU from the
-     Caretaker (if active), restores its updated architectural state from
-     `struct kvm_vcpu_arch_ser` back into the outgoing kernel's existing
-     `struct kvm_vcpu`, and frees `ser->arch_state` and `struct kvm_vcpu_ser`
-     (`kho_unpreserve_free()`). Because non-architectural host state (such as
-     memslots, secondary page tables, and device bindings) remained in place in
-     the outgoing kernel, the VMM can immediately resume `KVM_RUN`.
-   - **`vmfd` (`kvm_luo_unpreserve()`)**: Unpreserves any secondary page table
-     folios in `ser->kho_folios` (if `.freeze()` ran) and frees
-     `struct kvm_luo_ser`, leaving the live page tables intact in the outgoing
-     `struct kvm`.
-   - **`memfd` / `guest_memfd` (`memfd_luo_unpreserve()` /
-     `kvm_gmem_luo_unpreserve()`)**: Unfreezes the inode
-     (`shmem_freeze(inode, false)` or clearing `KVM_GMEM_FLAG_PRESERVED`),
-     unpins VMAs, and frees the KHO serialization metadata.
-3. **Incoming `.retrieve()` (`LIVEUPDATE_SESSION_RETRIEVE_FD`) and Retrieval
-   Order**:
-   In the incoming kernel, `luo_retrieve_file()` (used by both
-   `LIVEUPDATE_SESSION_RETRIEVE_FD` and `liveupdate_get_file_incoming()`)
-   resolves inter-file dependencies lazily:
-   - Both `kvm_gmem_luo_retrieve()` and `kvm_vcpu_luo_retrieve()` look up their
-     parent VM via `liveupdate_get_file_incoming(args->session, ser->vm_token,
-     &vm_file)`. If `vmfd` has not been retrieved yet (`retrieve_status == 0`),
-     LUO automatically invokes `kvm_luo_retrieve()` on `vm_token` first and
-     caches `luo_file->file`; when userspace later calls
-     `LIVEUPDATE_SESSION_RETRIEVE_FD` on `vm_token`, LUO installs a file
-     descriptor for that already-created `struct kvm`.
-   - In practice, the VMM retrieves `memfd`/`guest_memfd` and `vmfd` first,
-     re-establishes non-preserved VM state on `vmfd` (such as `mmap()`ing
-     `memfd`, registering memslots via `KVM_SET_USER_MEMORY_REGION2`, and
-     re-creating in-kernel IRQchip and device bindings), and then retrieves each
-     `vcpufd`:
-     - **`memfd` / `guest_memfd` (`memfd_luo_retrieve()` /
-       `kvm_gmem_luo_retrieve()`)**: Allocates a new file, calls
-       `kho_restore_folio()` on each preserved guest RAM folio, re-inserts the
-       folios into the new file's `inode->i_mapping` page cache at their
-       original page indices, and frees the KHO folio-list metadata.
-     - **`vmfd` (`kvm_luo_retrieve()`)**: Detaches preserved physical CPU
-       workloads (`kvm_caretaker_vm_pre_retrieve()`), allocates the new
-       `struct kvm` with the preserved `ser->type` (`kvm_create_vm_file()`), and
-       invokes `kvm_arch_vm_luo_retrieve()`, while keeping the outgoing kernel's
-       KHO-preserved secondary page table folios (`ser->kho_folios`) alive until
-       `.finish()`.
-     - **`vcpufd` (`kvm_vcpu_luo_retrieve()`)**: Allocates the new
-       `struct kvm_vcpu` (`kvm_create_vcpu_file()`), stops Caretaker execution
-       (`kvm_caretaker_vcpu_pre_retrieve()`), and restores the updated
-       architectural state from `ser->arch_state` (`struct kvm_vcpu_arch_ser`)
-       into the new `struct kvm_vcpu` (`kvm_arch_vcpu_luo_retrieve()` and
-       `kvm_caretaker_vcpu_retrieve()`).
-4. **Incoming `.finish()` (`LIVEUPDATE_SESSION_FINISH` or
-   `close(session_fd)`)**:
-   When userspace issues `LIVEUPDATE_SESSION_FINISH` (or closes the retrieved
-   session file descriptor), `luo_file_finish()` iterates over all session
-   entries in reverse order to release KHO handover memory:
-   - **`vcpufd` (`kvm_vcpu_luo_finish()`)**: Ensures the Caretaker vCPU has
-     stopped (in case `vcpufd` was never retrieved) and frees all KHO-preserved
-     vCPU allocations (`ser->arch_state`, `ser->cb`, per-vCPU hardware pages,
-     telemetry, and `struct kvm_vcpu_ser`) via `kho_restore_free()`.
-   - **`vmfd` (`kvm_luo_finish()`)**: Calls `kvm_kho_folios_finish()`
-     (`kho_restore_folio()` + `folio_put()`) to restore and free the outgoing
-     kernel's KHO-preserved secondary page table folios (as the incoming
-     `struct kvm` builds new secondary page tables against its memslots) and
-     frees `struct kvm_luo_ser`.
-   - **`memfd` / `guest_memfd` (`memfd_luo_finish()` /
-     `kvm_gmem_luo_finish()`)**: No-op if the file was retrieved (since
-     `.retrieve()` already moved the folios into the new file's page cache); if
-     never retrieved, discards and frees the unretrieved KHO folios.
-   - **LUO Session Core**: Drops LUO's internal `struct file *` reference
-     (`fput()`) on each retrieved file and destroys the session's KHO block set.
+   LUO session in any order. Both `guest_memfd` and `vcpufd` defer looking up
+   their parent `vm_token` (`liveupdate_get_token_outgoing()`) until
+   `.freeze()`, when all files have been added to the session and all vCPUs have
+   detached from `KVM_RUN` (leaving the VM's secondary page tables quiescent for
+   `kvm_luo_freeze()`).
+2. **Order-Independent Retrieval (`.retrieve()` -> `.finish()`)**:
+   In the incoming kernel, LUO resolves `ser->vm_token` on demand via
+   `liveupdate_get_file_incoming()`, automatically retrieving `vmfd` first if
+   `guest_memfd` or `vcpufd` is retrieved before `vmfd` (note that if the VM
+   uses an in-kernel IRQchip, the VMM still retrieves `vmfd` and creates the
+   IRQchip before retrieving `vcpufd`s so per-vCPU LAPIC/VGICv3 state can be
+   restored). Meanwhile, the outgoing kernel's KHO-preserved secondary page
+   table folios remain alive across `.retrieve()` (so Caretaker vCPUs can
+   continue executing until each `vcpufd` is retrieved) and are freed during
+   `.finish()`.
 
 ---
 
