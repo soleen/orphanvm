@@ -250,36 +250,54 @@ memory. This layer expands upon the base KVM `vmfd` preservation infrastructure
 (`virt/kvm/kvm_luo.c`) introduced by the [`guest_memfd` preservation
 series][guest-memfd-series].
 
-### 3.1 In-Kernel `vcpufd` Preservation (`KVM_CAP_VCPU_PRESERVE`)
+### 3.1 In-Kernel `vcpufd` Preservation
 
 In a traditional live update, the userspace VMM must extract all vCPU state via
 dozens of `KVM_GET_*` ioctls prior to `kexec`, serialize that state into a file
 or memory buffer, and re-issue `KVM_SET_*` ioctls after `kexec`.
 
-In RFCv1, `vcpufd` is preserved directly into a LUO session via
-`LIVEUPDATE_SESSION_PRESERVE_FD` (`"kvm_vcpu_luo_v1"`), governed by the
+In this proposal, `vcpufd` is preserved into a LUO session, governed by the
 `KVM_CAP_VCPU_PRESERVE` capability:
 
-- **Top-Level ABI (`include/linux/kho/abi/kvm.h`)**:
-  `struct kvm_vcpu_ser` records the vCPU identifier, preservation flags (such as
-  `KVM_VCPU_LUO_FLAG_CARETAKER`), the LUO token of the parent VM (`vm_token`),
-  and KHO pointers to the architecture state buffer (`arch_state`) and Caretaker
-  control block (`cb`):
+- **`vcpufd` Common ABI (`struct kvm_vcpu_ser`)**:
+  Defined in `include/linux/kho/abi/kvm.h`, it records the vCPU identifier
+  (`vcpu_id`), the LUO token of the parent VM (`vm_token`), and KHO pointers to
+  the architectural state buffer (`arch_state`) and Caretaker control block
+  (`cb`):
 
   ```c
   struct kvm_vcpu_ser {
           u32 vcpu_id;
-          u32 flags;
           u64 vm_token;
           DECLARE_KHOSER_PTR(arch_state, struct kvm_vcpu_arch_ser *);
           DECLARE_KHOSER_PTR(cb, struct kvm_caretaker_cb_ser *);
-  } __packed;
+  };
   ```
 
-- **uAPI-Backed Architectural State (`struct kvm_vcpu_arch_ser`)**:
-  To avoid exposing internal kernel structures across `kexec`, the kernel
-  serializes vCPU state into KHO-preserved pages using existing KVM uAPI
-  structures:
+  A vCPU can be preserved either with or without the Caretaker, determined by
+  whether `cb` is populated:
+  - **Without Caretaker (`cb == NULL`)**: The vCPU is suspended in RAM across
+    `kexec`; `.preserve()` serializes its state into `arch_state`, and
+    `.retrieve()` restores it into the new `struct kvm_vcpu` in the incoming
+    kernel.
+  - **With Caretaker (`cb != NULL`)**: The vCPU is handed off to the Caretaker
+    to execute on a preserved physical CPU across `kexec`. `cb` points to the
+    Caretaker control block (`struct kvm_caretaker_cb_ser`, detailed in Section
+    6.1), which coordinates the cross-kernel execution state machine (`PAUSED`,
+    `RUNNING`, `STOPPING`, `STOPPED`) and tracks which physical CPU owns the
+    vCPU while `arch_state` serves as the register handoff buffer between the
+    outgoing kernel, the Caretaker, and the incoming kernel.
+
+- **`vcpufd` Architectural State (`struct kvm_vcpu_arch_ser`)**:
+  To avoid modifying common KVM code or defining a separate, complex
+  serialization format, this proposal composes the `vcpufd` arch-specific ABI
+  using existing KVM uAPI structures. Note while uAPI structures are generally
+  stable, they can still evolve over time by expanding layouts. Embedding uAPI
+  structures is therefore not a complete ABI stability guarantee on its own,
+  but combined with LUO ABI versioning (which, as noted in Section 1.2, is
+  developed as an orthogonal effort), any incompatible layout change is
+  detectable and will automatically mark a Live Update between those kernel
+  versions as incompatible:
   - **x86 (`include/linux/kho/abi/kvm_x86.h`)**:
 
     ```c
@@ -287,10 +305,8 @@ In RFCv1, `vcpufd` is preserved directly into a LUO session via
             struct kvm_regs regs;
             struct kvm_sregs sregs;
             struct kvm_mp_state mp_state;
-            u32 pad;
             struct kvm_xcrs xcrs;
             struct kvm_lapic_state lapic;
-            u8 pad_xsave[40];
             struct kvm_xsave xsave;
             struct kvm_vcpu_events events;
             struct kvm_debugregs debugregs;
@@ -298,7 +314,7 @@ In RFCv1, `vcpufd` is preserved directly into a LUO session via
             u32 num_msrs;
             u32 cpuid_nent;
             struct kvm_msr_entry msrs[];
-    } __packed;
+    };
     ```
 
     `xsave` is 64-byte aligned so the Caretaker can execute hardware `XSAVE64`
@@ -312,27 +328,17 @@ In RFCv1, `vcpufd` is preserved directly into a LUO session via
     struct kvm_vcpu_arch_ser {
             struct kvm_regs regs;
             struct kvm_mp_state mp_state;
-            u32 pad;
             struct kvm_vcpu_events events;
             struct kvm_vcpu_init init;
             u32 num_sysregs;
-            u32 reserved;
             struct kvm_one_reg sysregs[];
-    } __packed;
+    };
     ```
 
     `sysregs[num_sysregs]` stores each system and VGICv3 CPU interface
     register's `id` and 64-bit value (in `addr`), enumerated via
     `kvm_arm_get_sys_reg_indices()` and read/written using in-kernel accessors
     (`kvm_arm_sys_reg_read()` / `kvm_arm_sys_reg_write()`).
-
-When a LUO session contains preserved `vmfd` and `vcpufd` descriptors *without*
-preserved physical CPUs, `.preserve()` serializes the vCPU into
-`struct kvm_vcpu_arch_ser` and `.retrieve()` restores it into the newly
-allocated `struct kvm_vcpu` in the incoming kernel. When physical CPUs *are*
-present in the LUO session, this same `struct kvm_vcpu_arch_ser` buffer serves
-as the handoff area between the outgoing kernel, the Caretaker, and the incoming
-kernel.
 
 ### 3.2 Secondary Page Table Preservation
 
@@ -351,12 +357,12 @@ serializes the VM type and a KHO pointer to the preserved folio list
 struct kvm_kho_folios_ser {
         u64 nr_folios;
         u64 folios_pa[];
-} __packed;
+};
 
 struct kvm_luo_ser {
         u64 type;
         DECLARE_KHOSER_PTR(kho_folios, struct kvm_kho_folios_ser *);
-} __packed;
+};
 ```
 
 Each architecture walks its secondary page tables during `vmfd` preservation to
@@ -551,10 +557,9 @@ the file descriptor into a LUO session via `LIVEUPDATE_SESSION_PRESERVE_FD`
 ```c
 struct cpu_preserved_file_ser {
         u32 cpu;
-        u32 reserved;
         u64 stack_pa;
         DECLARE_KHOSER_PTR(oncore, struct oncore_session_ser *);
-} __packed;
+};
 ```
 
 ```
@@ -611,7 +616,6 @@ LIVEUPDATE_SESSION_PRESERVE_FD
      ```c
      struct cpu_preserved_global_ser {
              u32 nr_cpu_words;
-             u32 reserved;
              u64 text_runtime_pa;
              u64 text_runtime_size;
              u64 data_runtime_pa;
@@ -619,7 +623,7 @@ LIVEUPDATE_SESSION_PRESERVE_FD
              DECLARE_KHOSER_PTR(pcpus_runtime, struct cpu_preserved_pcpu_ser *);
              DECLARE_KHOSER_PTR(transition_as, struct cpu_preserved_as_ser *);
              u64 cpu_preserved_bitmap[];
-     } __packed;
+     };
      ```
 
      During early boot in the **incoming kernel**,
@@ -686,9 +690,8 @@ incoming kernel can adopt (`cpu_preserved_as_adopt()`) and free them
 ```c
 struct cpu_preserved_as_ser {
         u32 nr_pgtable_pages;
-        u32 reserved;
         u64 pgtable_pages[CPU_PRESERVED_AS_MAX_PGTABLE_PAGES];
-} __packed;
+};
 ```
 
 To avoid relying on host per-CPU offset registers (`%gs` on x86 or
@@ -702,7 +705,6 @@ by masking the stack pointer (`sp & ~(CPU_PRESERVED_STACK_SIZE - 1)`):
 struct cpu_preserved_stack_context {
         u64 magic;
         u32 cpu;
-        u32 reserved;
         u64 workload_context;
         u64 session_pgd_pa;
 };
@@ -785,13 +787,12 @@ When `CONFIG_KVM_CARETAKER` (`KVM_CAP_CARETAKER`) is supported and a `vcpufd` is
 preserved into a LUO session that also contains preserved physical CPUs:
 
 1. `kvm_caretaker_vcpu_pre_preserve()` allocates a `struct oncore_job` for
-   `kvm_arch_vcpu_caretaker_run()` on the session's least-loaded preserved
-   physical CPU and sets `KVM_VCPU_LUO_FLAG_CARETAKER`.
+   `kvm_arch_vcpu_caretaker_run()` on the session.
 2. `kvm_arch_vcpu_luo_preserve()` serializes the vCPU's architectural state into
    `struct kvm_vcpu_arch_ser`, initializes the architecture Caretaker runtime
    page (`kvm_caretaker_init_common_vcpu()`, setting `cb->state` to
-   `KVM_CARETAKER_PAUSED`), and maps the runtime page and `arch_state` buffer
-   into the session's isolated `cpu_preserved_as`.
+   `KVM_CARETAKER_PAUSED` and populating `ser->cb`), and maps the runtime page
+   and `arch_state` buffer into the session's isolated `cpu_preserved_as`.
 3. `kvm_caretaker_vcpu_post_preserve()` binds `cb` to the job and calls
    `oncore_session_activate_job()`, queuing the job on the `oncore_runqueue`:
    if an idle preserved physical CPU is parked in `cpu_preserved_park_loop()`,
@@ -818,9 +819,8 @@ on outgoing-kernel internal structures**. Only structures defined in
             u32 state;
             u32 pcpu_id;
             u32 vcpu_id;
-            u32 reserved;
             DECLARE_KHOSER_PTR(telemetry, struct kvm_caretaker_telemetry_ser *);
-    } __packed;
+    };
     ```
 
   - `struct kvm_caretaker_arch_ser`: Contains `struct kvm_caretaker_cb_ser cb`
@@ -1009,7 +1009,7 @@ struct kvm_caretaker_telemetry_ser {
         u64 last_exit_rip;
         u64 stall_exit_reason;
         u64 stall_exit_rip;
-} __packed;
+};
 ```
 
 When the incoming kernel adopts the vCPU, it copies this telemetry from the KHO

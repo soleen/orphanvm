@@ -66,3 +66,41 @@ host `kexec` reboot while keeping guest vCPUs executing in the Caretaker:
   `mm_struct` either needs fresh `vmfd`/`vcpufd` instances created via LUO
   retrieve (`LIVEUPDATE_SESSION_RETRIEVE_FD`) or explicit `kvm->mm` rebinding.
 
+## 5. Remove Redundant `flags` from `struct kvm_vcpu_ser`
+
+`struct kvm_vcpu_ser` (`include/linux/kho/abi/kvm.h`) currently defines a
+`u32 flags` field whose only flag is `KVM_VCPU_LUO_FLAG_CARETAKER`, which is
+redundant with `vcpu->caretaker.job` during `.preserve()` and
+`ser->cb.phys != 0` (`KHOSER_LOAD_PTR(ser->cb) != NULL`) across
+`.post_preserve()`, `.unpreserve()`, `.retrieve()`, and `.finish()`:
+
+- Remove `enum kvm_vcpu_luo_flags` (`KVM_VCPU_LUO_FLAG_CARETAKER`) and replace
+  `u32 flags` in `struct kvm_vcpu_ser` with `u32 reserved` (must be zero).
+- Check `vcpu->caretaker.job != NULL` in `kvm_arch_vcpu_luo_preserve()` and
+  `KHOSER_LOAD_PTR(ser->cb) != NULL` (or `ser->cb.phys != 0`) in
+  `virt/kvm/caretaker.c`, `virt/kvm/caretaker_debug.c`, `arch/x86/kvm/`, and
+  `arch/arm64/kvm/`.
+
+---
+
+## Already Implemented Since RFCv1
+
+1. **Map Session Buffers into Per-Session `cpu_preserved_as`**:
+   - `oncore_session_map_range()` (`kernel/liveupdate/oncore.c`) maps buffers
+     into `sess->as` via `cpu_preserved_as_map()` when `sess && sess->as` is
+     valid instead of falling back to the global `cpu_preserved_map_range()`.
+   - `kvm_arch_vcpu_caretaker_preserve()` (`arch/x86/kvm/caretaker.c`) maps
+     `struct kvm_vcpu_arch_ser *state` into the session's isolated address space
+     via `oncore_session_map_buffer(sess, state, size)`.
+2. **Preserve `kvmclock` and Refresh `MSR_IA32_TSC` Across `kexec` on x86**:
+   - Added `struct kvm_clock_data clock` to `struct kvm_vcpu_arch_ser`
+     (`include/linux/kho/abi/kvm_x86.h`) and exposed in-kernel `get_kvmclock()`
+     and `kvm_set_clock()` helpers (`arch/x86/kvm/x86.c`).
+   - `kvm_arch_vcpu_luo_preserve()` and `kvm_arch_vcpu_luo_retrieve()`
+     (`arch/x86/kvm/kvm_luo.c`) save and restore `kvmclock` state and restore
+     `MSR_IA32_TSC` and `MSR_IA32_TSC_ADJUST` across Caretaker retrieval.
+   - `vmx_caretaker_post_exit()` (`arch/x86/kvm/vmx/caretaker.c`) and
+     `svm_caretaker_detach_serialize()` (`arch/x86/kvm/svm/caretaker.c`) refresh
+     `MSR_IA32_TSC` in `state->msrs[]` (`rdtsc() + tsc_offset`) at exit time so
+     `kvm_synchronize_tsc()` on retrieve computes the preserved `tsc_offset`
+     instead of a stale pre-`kexec` timestamp.
