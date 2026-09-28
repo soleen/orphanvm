@@ -437,7 +437,49 @@ CPU from the outgoing Linux kernel, keeping it executing in a self-contained
 memory environment across `kexec`, and returning it to the incoming Linux kernel
 when the live update completes.
 
-### 4.1 Preserved Sections and Relocation Outside KHO Scratch
+### 4.1 Lifecycle of Preserved Physical CPUs
+
+Each non-boot physical CPU exposes a sysfs control file:
+`/sys/devices/system/cpu/cpu<N>/preserve`. Preserving this file descriptor into
+a LUO session transitions the physical core through the following lifecycle
+across `kexec`:
+
+```
+               LIVEUPDATE_SESSION_PRESERVE_FD
+  [ Online ] ---------------------------------> [ Offline ]
+      ^                                              |
+      | add_cpu()                                    | cpu_preserved_park()
+      | set_cpu_present(true)                        | set_cpu_present(false)
+      |                                              v
+  [ Offline ] <-------------------------------- [ Preserved ]
+                LIVEUPDATE_SESSION_FINISH        - survives kexec
+                (or optional pre-kexec cancel)   - runs park_loop / jobs
+```
+
+1. **Entering Preserved Mode (`Online -> Offline -> Preserved`)**:
+   Preserving `/sys/devices/system/cpu/cpu<N>/preserve` reuses standard Linux
+   CPU hotplug (`remove_cpu(cpu)`) to migrate all tasks, timers, and interrupts
+   off the core. At the final offline step, instead of entering a platform
+   sleep state (ACPI/PSCI), the core switches to its preserved stack and
+   isolated page tables and enters `cpu_preserved_park_loop()`, while the host
+   clears `cpu_present(cpu)`.
+2. **(Optional) Pre-`kexec` Cancellation (`Preserved -> Offline -> Online`)**:
+   If the LUO session is closed before `kexec`, `.unpreserve()` aborts the
+   preservation and returns the core to the outgoing kernel using the same
+   reclamation sequence as step 4.
+3. **Surviving `kexec` (`!cpu_present(cpu)`)**:
+   Because the core is marked not present, the outgoing kernel's `kexec`
+   shutdown path skips sending stop IPIs to it, and the incoming kernel's early
+   boot (`cpu_preserved_flb_retrieve()`) clears `cpu_present(cpu)` before
+   `smp_init()` so SMP bringup skips resetting the core (`INIT`/`SIPI` on x86,
+   PSCI `CPU_ON` on ARM64).
+4. **Returning to the Host (`Preserved -> Offline -> Online`)**:
+   On `LIVEUPDATE_SESSION_FINISH` in the incoming kernel (or pre-`kexec`
+   cancellation), the host signals the core to exit `cpu_preserved_park_loop()`,
+   restores `set_cpu_present(cpu, true)`, and hotplugs the CPU back online via
+   `add_cpu(cpu)`.
+
+### 4.2 Preserved Sections and Relocation Outside KHO Scratch
 
 All code and static data executed by a preserved CPU during the `kexec` window
 are placed in dedicated linker sections:
@@ -471,154 +513,22 @@ copies `.text.cpu_preserved` and `.data.cpu_preserved` into them, and remaps the
 section virtual addresses to the new physical pages so linked symbol references
 continue to work across `kexec`.
 
-### 4.2 Lifecycle and `!cpu_present(cpu)` SMP Isolation
-
-Each non-boot physical CPU exposes a sysfs control file:
-`/sys/devices/system/cpu/cpu<N>/preserve`.
-
-To preserve a CPU for a live update, userspace opens this file and preserves
-the file descriptor into a LUO session via `LIVEUPDATE_SESSION_PRESERVE_FD`
-(`"cpu_fh_v1"`, `include/linux/kho/abi/cpu.h`):
-
-```c
-struct cpu_preserved_file_ser {
-        u32 cpu;
-        u64 stack_pa;
-        DECLARE_KHOSER_PTR(oncore, struct oncore_session_ser *);
-};
-```
-
-```
-Outgoing Kernel                      kexec                     Incoming Kernel
----------------                      -----                     ---------------
-open(/sys/.../cpuN/preserve)
-LIVEUPDATE_SESSION_PRESERVE_FD
-  -> remove_cpu(cpu)
-  -> cpuhp_ap_report_dead()
-  -> cpu_preserved_report_dead()
-  -> cpu_preserved_park():
-       switch SP & CR3/TTBR1
-       cpu_preserved_park_loop()
-  -> set_cpu_present(cpu, false)
-                                 cpu_preserved_park_loop()
-                                 runs continuously in    early boot:
-                                 isolated address space    cpu_preserved_flb_retrieve()
-                                                           set_cpu_present(cpu, false)
-                                                         smp_init():
-                                                           skips !cpu_present(cpu)
-                                                         LIVEUPDATE_SESSION_FINISH:
-                                                           cpu_signal_exit(cpu)
-                                                           set_cpu_present(cpu, true)
-                                                           add_cpu(cpu) -> online
-```
-
-1. **Hotplug Interception**:
-   During `cpu_preserve_preserve()`, the kernel calls `cpu_preserve(cpu)`, which
-   marks the CPU preserved in `cpu_preserved_mask` and calls `remove_cpu(cpu)`.
-   Standard Linux CPU hotplug migrates all tasks, timers, and interrupts off the
-   core until the CPU reaches the terminal offline hook in
-   `cpuhp_ap_report_dead()`. After updating the hotplug sync state to
-   `SYNC_STATE_DEAD`, `cpuhp_ap_report_dead()` calls
-   `cpu_preserved_report_dead()`, which diverts preserved cores into
-   `cpu_preserved_park()` instead of `arch_cpu_idle_dead()` (which would place
-   the core in an ACPI/PSCI sleep state).
-2. **Isolating via `!cpu_present(cpu)` Across the Kexec Gap**:
-   Once `remove_cpu(cpu)` completes and the target core is executing on its
-   preserved stack and isolated page tables in `cpu_preserved_park_loop()`, the
-   outgoing kernel calls `set_cpu_present(cpu, false)`.
-   - Because each preserved core is already offline, removed from
-     `cpu_present_mask`, and executing inside its isolated address space from
-     the moment `LIVEUPDATE_SESSION_PRESERVE_FD` completes, neither
-     `cpu_preserve_file_ops` nor `cpu_preserved_flb_ops` requires a `.freeze()`
-     callback at `kexec` time.
-   - In the **outgoing kernel**, marking the CPU neither online nor present
-     ensures that `reboot` / `kexec` shutdown paths (`smp_send_stop()`,
-     `native_stop_other_cpus()`) skip sending `REBOOT_VECTOR` or `STOP` IPIs to
-     the preserved core.
-   - Across `kexec`, a LUO FLB global structure (`"cpu_flb_v1"`,
-     `include/linux/kho/abi/cpu.h`) carries the preserved runtime buffer
-     addresses and the bitmap of preserved CPUs (`cpu_preserved_bitmap`):
-
-     ```c
-     struct cpu_preserved_global_ser {
-             u32 nr_cpu_words;
-             u64 text_runtime_pa;
-             u64 text_runtime_size;
-             u64 data_runtime_pa;
-             u64 data_runtime_size;
-             DECLARE_KHOSER_PTR(pcpus_runtime, struct cpu_preserved_pcpu_ser *);
-             DECLARE_KHOSER_PTR(transition_as, struct cpu_preserved_as_ser *);
-             u64 cpu_preserved_bitmap[];
-     };
-     ```
-
-     During early boot in the **incoming kernel**,
-     `cpu_preserved_flb_retrieve()` reads `cpu_preserved_bitmap` and calls
-     `set_cpu_present(cpu, false)` *before* `smp_init()` runs. Because
-     `smp_init()` only brings up CPUs in `cpu_present_mask`, the incoming kernel
-     skips sending `INIT`/`SIPI` (x86) or `CPU_ON` PSCI calls (ARM64) to
-     preserved cores without requiring architecture-specific changes in the SMP
-     boot path.
-3. **Cancellation and Incoming Kernel Reclamation**:
-   - **Cancellation (`cpu_preserve_unpreserve()` +
-     `cpu_preserved_flb_unpreserve()`)**: If the LUO session file descriptor is
-     closed before `kexec`, `cpu_preserve_unpreserve()` calls
-     `cpu_unpreserve(cpu)` (which sets `ser->workload` to
-     `CPU_PRESERVED_EXITING` via `cpu_signal_exit(cpu)`, sends a wakeup IPI via
-     `arch_cpu_preserved_kick()`, waits in `cpu_wait_dead(cpu)` for the core to
-     exit `cpu_preserved_park_loop()` and publish `CPU_PRESERVED_DEAD`, frees
-     its preserved stack, restores `set_cpu_present(cpu, true)`, and calls
-     `add_cpu(cpu)` to return the core to the host scheduler) and removes the
-     CPU from `oncore_session` (`oncore_session_remove_cpu()`). Once the last
-     preserved CPU is unpreserved, `cpu_preserved_flb_unpreserve()` unpreserves
-     the `.text.cpu_preserved` / `.data.cpu_preserved` runtime buffer pages and
-     `cpu_preserved_transition_as` page tables.
-   - **Incoming Kernel Reclamation (`cpu_preserve_finish()` +
-     `cpu_preserved_flb_finish()`)**: Userspace does not need to call
-     `LIVEUPDATE_SESSION_RETRIEVE_FD` for preserved physical CPU tokens
-     (`"cpu_fh_v1"`). When `LIVEUPDATE_SESSION_FINISH` is issued (or the
-     session file descriptor is closed), `cpu_preserve_finish()` automatically
-     reconstructs the incoming CPU state (`cpu_preserve_restore_incoming_cpu()`)
-     if `.retrieve()` was not called, invokes `cpu_unpreserve(cpu)`
-     (`CPU_PRESERVED_EXITING` -> `CPU_PRESERVED_DEAD` ->
-     `set_cpu_present(cpu, true)` -> `add_cpu(cpu)`), removes the CPU from
-     `oncore_session` (`oncore_session_remove_cpu()`, which destroys the
-     session and frees its isolated page tables `cpu_preserved_as` once the last
-     CPU is removed), and frees `struct cpu_preserved_file_ser`. Once the last
-     preserved CPU finishes, `cpu_preserved_flb_finish()` frees the outgoing
-     kernel's preserved `.text.cpu_preserved` / `.data.cpu_preserved` buffer
-     pages, `cpu_preserved_transition_as` page tables, and `pcpus_ser` array via
-     `kho_restore_free()`.
-
-### 4.3 Isolated Address Space (`struct cpu_preserved_as`) and Stack Context
+### 4.3 Isolated Address Space and Stack Context
 
 Before `kexec` overwrites the outgoing kernel's page tables, each preserved CPU
 switches its MMU root (`CR3` on x86, `TTBR1_EL1`/`TTBR0_EL2` on ARM64) to an
-isolated address space (`struct cpu_preserved_as`).
+isolated address space (`struct cpu_preserved_as`), constructed using
+`kernel_ident_mapping_init()` on x86 and `trans_pgd_map_range()` on ARM64.
 
 The isolated page tables map **only**:
 - `.text.cpu_preserved` (`PAGE_KERNEL_ROX`)
 - `.data.cpu_preserved` (`PAGE_KERNEL`)
-- The preserved `pcpus_ser` (`struct cpu_preserved_pcpu_ser`) and `pcpus`
-  (`struct cpu_preserved_pcpu`) arrays and per-CPU preserved stacks
+- The preserved per-CPU state arrays and per-CPU preserved stacks
 - Explicitly mapped workload buffers registered into the session's address space
   via `oncore_session_map_range()` (`cpu_preserved_as_map()`)
 
-No other host kernel memory (neither the kernel linear direct map `PAGE_OFFSET`,
-nor `vmalloc`, nor normal `.text`/`.data`) is mapped in `cpu_preserved_as`. Page
-tables are constructed using `kernel_ident_mapping_init()` (extended with
-`force_pte = true` and `offset = page_va - page_pa` for 4KB page granularity) on
-x86 and `trans_pgd_map_range()` on ARM64. All page-table pages allocated for the
-isolated address space are recorded in `struct cpu_preserved_as_ser` so the
-incoming kernel can adopt (`cpu_preserved_as_adopt()`) and free them
-(`cpu_preserved_as_destroy()`) after the CPU returns to normal operation:
-
-```c
-struct cpu_preserved_as_ser {
-        u32 nr_pgtable_pages;
-        u64 pgtable_pages[CPU_PRESERVED_AS_MAX_PGTABLE_PAGES];
-};
-```
+No other host kernel memory (neither the linear direct map `PAGE_OFFSET`, nor
+`vmalloc`, nor normal `.text`/`.data`) is mapped in `cpu_preserved_as`.
 
 To avoid relying on host per-CPU offset registers (`%gs` on x86 or
 `TPIDR_EL1`/`TPIDR_EL2` on ARM64), which may be clobbered by guest execution or
@@ -635,6 +545,81 @@ struct cpu_preserved_stack_context {
         u64 session_pgd_pa;
 };
 ```
+
+### 4.4 KHO Serialization ABI (`include/linux/kho/abi/cpu.h`)
+
+Physical CPU preservation state is handed over across `kexec` using four KHO ABI
+structures defined in `include/linux/kho/abi/cpu.h`:
+
+1. **Per-CPU File Descriptor State (`struct cpu_preserved_file_ser`)**:
+   Serialized when `/sys/devices/system/cpu/cpu<N>/preserve` is preserved via
+   `LIVEUPDATE_SESSION_PRESERVE_FD`:
+
+   ```c
+   struct cpu_preserved_file_ser {
+           u32 cpu;
+           u64 stack_pa;
+           DECLARE_KHOSER_PTR(oncore, struct oncore_session_ser *);
+   };
+   ```
+
+   - `cpu`: Logical CPU identifier of the preserved physical CPU.
+   - `stack_pa`: Physical address of the KHO-preserved stack allocated for this
+     CPU's isolated execution context (freed during `.finish()`).
+   - `oncore`: KHO pointer to the serialized `oncore` session metadata
+     (`struct oncore_session_ser`, detailed in Section 5) if an `oncore`
+     workload session is attached to this CPU, or `NULL` otherwise.
+
+2. **Global FLB State (`struct cpu_preserved_global_ser` and
+   `struct cpu_preserved_pcpu_ser`)**:
+   Preserved once across all sessions via a LUO File-Lifecycle-Bound (FLB)
+   object so the incoming kernel can discover preserved CPUs during early boot
+   before any session fd is retrieved:
+
+   ```c
+   struct cpu_preserved_pcpu_ser {
+           u32 workload;
+   };
+
+   struct cpu_preserved_global_ser {
+           u32 nr_cpu_words;
+           u64 text_runtime_pa;
+           u64 text_runtime_size;
+           u64 data_runtime_pa;
+           u64 data_runtime_size;
+           DECLARE_KHOSER_PTR(pcpus_runtime, struct cpu_preserved_pcpu_ser *);
+           DECLARE_KHOSER_PTR(transition_as, struct cpu_preserved_as_ser *);
+           u64 cpu_preserved_bitmap[];
+   };
+   ```
+
+   - `nr_cpu_words` and `cpu_preserved_bitmap[]`: Explicit 64-bit word count and
+     bitmap of preserved logical CPUs (independent of `CONFIG_NR_CPUS`), read by
+     `cpu_preserved_flb_retrieve()` during early boot to clear
+     `cpu_present(cpu)`.
+   - `text_runtime_pa` / `text_runtime_size` and `data_runtime_pa` /
+     `data_runtime_size`: Physical address and byte size of the relocated
+     `.text.cpu_preserved` and `.data.cpu_preserved` buffers so the incoming
+     kernel can free them once all preserved CPUs finish.
+   - `pcpus_runtime`: KHO pointer to the per-CPU mailbox array
+     (`struct cpu_preserved_pcpu_ser`), where `workload` tracks each CPU's state
+     (`CPU_PRESERVED_PARKED`, `CPU_PRESERVED_WORKLOAD`, `CPU_PRESERVED_EXITING`,
+     `CPU_PRESERVED_DEAD`).
+   - `transition_as`: KHO pointer to the default isolated address space used by
+     parked CPUs when no session address space is active.
+
+3. **Isolated Address Space Metadata (`struct cpu_preserved_as_ser`)**:
+   Records the physical addresses of all page-table pages allocated for an
+   isolated address space (with the root PGD at index `0`) so the incoming
+   kernel can adopt (`cpu_preserved_as_adopt()`) and free them
+   (`cpu_preserved_as_destroy()`) during `.finish()`:
+
+   ```c
+   struct cpu_preserved_as_ser {
+           u32 nr_pgtable_pages;
+           u64 pgtable_pages[CPU_PRESERVED_AS_MAX_PGTABLE_PAGES];
+   };
+   ```
 
 ---
 
