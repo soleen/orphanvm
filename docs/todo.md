@@ -1,5 +1,29 @@
 # OrphanVM RFCv2 TODO
 
+## Already Implemented Since RFCv1
+
+1. **Map Session Buffers into Per-Session `cpu_preserved_as`**:
+   - `oncore_session_map_range()` (`kernel/liveupdate/oncore.c`) maps buffers
+     into `sess->as` via `cpu_preserved_as_map()` when `sess && sess->as` is
+     valid instead of falling back to the global `cpu_preserved_map_range()`.
+   - `kvm_arch_vcpu_caretaker_preserve()` (`arch/x86/kvm/caretaker.c`) maps
+     `struct kvm_vcpu_arch_ser *state` into the session's isolated address space
+     via `oncore_session_map_buffer(sess, state, size)`.
+2. **Preserve `kvmclock` and Refresh `MSR_IA32_TSC` Across `kexec` on x86**:
+   - Added `struct kvm_clock_data clock` to `struct kvm_vcpu_arch_ser`
+     (`include/linux/kho/abi/kvm_x86.h`) and exposed in-kernel `get_kvmclock()`
+     and `kvm_set_clock()` helpers (`arch/x86/kvm/x86.c`).
+   - `kvm_arch_vcpu_luo_preserve()` and `kvm_arch_vcpu_luo_retrieve()`
+     (`arch/x86/kvm/kvm_luo.c`) save and restore `kvmclock` state and restore
+     `MSR_IA32_TSC` and `MSR_IA32_TSC_ADJUST` across Caretaker retrieval.
+   - `vmx_caretaker_post_exit()` (`arch/x86/kvm/vmx/caretaker.c`) and
+     `svm_caretaker_detach_serialize()` (`arch/x86/kvm/svm/caretaker.c`) refresh
+     `MSR_IA32_TSC` in `state->msrs[]` (`rdtsc() + tsc_offset`) at exit time so
+     `kvm_synchronize_tsc()` on retrieve computes the preserved `tsc_offset`
+     instead of a stale pre-`kexec` timestamp.
+
+---
+
 ## 1. Decouple Physical CPU Preservation (`cpu_preserve`) from `oncore`
 
 Currently, `cpu_preserve_preserve()` (`kernel/liveupdate/cpu_preserve.c`)
@@ -51,22 +75,7 @@ RAM-only preservation and requires physical CPUs to be preserved before
   in-kernel `oncore_job` to verify Layer 3 (`CONFIG_LIVEUPDATE_ONCORE`)
   scheduling capabilities across `kexec` independently of KVM.
 
-## 4. VMM-Only Live Update Using LUO + OrphanVM
-
-Investigate how to live-update the userspace VMM process without performing a
-host `kexec` reboot while keeping guest vCPUs executing in the Caretaker:
-
-- Determine whether the old VMM needs to pass its existing `vmfd`, `vcpufd`, and
-  `memfd`/`guest_memfd` descriptors (or the LUO session descriptor) to the new
-  VMM process, or whether LUO can allow retrieving preserved file descriptors
-  back on cancel / same-kernel session retrieval.
-- Note that upstream KVM binds `struct kvm` to the creating process's
-  `struct mm_struct` (`kvm->mm != current->mm` returns `-EIO` in
-  `kvm_vm_ioctl()` and `kvm_vcpu_ioctl()`), so a new VMM process with a new
-  `mm_struct` either needs fresh `vmfd`/`vcpufd` instances created via LUO
-  retrieve (`LIVEUPDATE_SESSION_RETRIEVE_FD`) or explicit `kvm->mm` rebinding.
-
-## 5. Remove Redundant `flags` from `struct kvm_vcpu_ser`
+## 4. Remove Redundant `flags` from `struct kvm_vcpu_ser`
 
 `struct kvm_vcpu_ser` (`include/linux/kho/abi/kvm.h`) currently defines a
 `u32 flags` field whose only flag is `KVM_VCPU_LUO_FLAG_CARETAKER`, which is
@@ -81,7 +90,7 @@ redundant with `vcpu->caretaker.job` during `.preserve()` and
   `virt/kvm/caretaker.c`, `virt/kvm/caretaker_debug.c`, `arch/x86/kvm/`, and
   `arch/arm64/kvm/`.
 
-## 6. Separate Variable-Length Arrays in `struct kvm_vcpu_arch_ser`
+## 5. Separate Variable-Length Arrays in `struct kvm_vcpu_arch_ser`
 
 Currently, x86 `struct kvm_vcpu_arch_ser` (`include/linux/kho/abi/kvm_x86.h`)
 packs `msrs[num_msrs]` and `cpuid_nent` `struct kvm_cpuid_entry2` entries
@@ -106,7 +115,7 @@ arithmetic (`(void *)&state->msrs[state->num_msrs]`), and ARM64
   `struct kvm_arm64_sysregs_ser` (on ARM64) within a single contiguous
   `kho_alloc_preserve(size)` allocation so there is zero extra page overhead.
 
-## 7. Defer Secondary Page Tables and `vm_token` Lookup to `.freeze()`
+## 6. Defer Secondary Page Tables and `vm_token` Lookup to `.freeze()`
 
 Currently, secondary page tables (`struct kvm_kho_folios_ser`) are walked and
 passed to `kho_preserve_folio()` during `LIVEUPDATE_SESSION_PRESERVE_FD(vmfd)`
@@ -144,7 +153,7 @@ passed to `kho_preserve_folio()` during `LIVEUPDATE_SESSION_PRESERVE_FD(vmfd)`
     `mmu_lock`) + `kho_preserve_folio()` (outside `mmu_lock`) pattern on both
     x86 and ARM64.
 
-## 8. Clean Up `__cpu_preserved_text` Attributes and `Makefile` Flags
+## 7. Clean Up `__cpu_preserved_text` Attributes and `Makefile` Flags
 
 Currently, `kernel/liveupdate/Makefile`, `arch/x86/kvm/Makefile`, and
 `arch/arm64/kvm/Makefile` duplicate `-fno-stack-protector` and per-file
@@ -164,26 +173,98 @@ missing several kernel hardening flags used by `arch/arm64/kvm/hyp/nvhe` and
   calls), `GCOV_PROFILE_<obj>.o := n`, and `KMSAN_SANITIZE_<obj>.o := n`
   alongside `-fno-jump-tables` and `-ftrivial-auto-var-init=uninitialized`.
 
+## 8. Simplify Isolated Address Space and Stack Context in `cpu_preserve`
+
+Currently, `cpu_preserve_preserve()` (`kernel/liveupdate/cpu_preserve.c`) calls
+`cpu_preserve(cpu)` before `oncore_session_add_cpu()`, parking the CPU on a
+global `cpu_preserved_transition_as` and using `cpu_preserved_map_buffer()`
+(`cpu_preserved_as_list`) to broadcast the CPU's preserved stack into every
+session's address space, only for `oncore_session_add_cpu()` on the next line to
+switch the CPU to `sess->as`. In addition, `struct cpu_preserved_as` duplicates
+fields from `struct cpu_preserved_as_ser` and allocates a dummy wrapper in
+`cpu_preserved_as_adopt()` during incoming teardown, while `outgoing->pcpus`
+(`struct cpu_preserved_pcpu`) is allocated with `kcalloc()` (not KHO-preserved)
+yet mapped into the isolated address space and read by
+`cpu_preserved_run_workload()`:
+
+- **Scope isolated address spaces strictly per-session**:
+  - Create or look up the session's isolated address space before parking the
+    CPU in `cpu_preserve_preserve()`, map the CPU's preserved stack only into
+    its owning session's address space, and set `sctx->session_pgd_pa` before
+    calling `remove_cpu(cpu)`.
+  - Remove `as->node`, `cpu_preserved_as_list`, `cpu_preserved_as_list_lock`,
+    `cpu_preserved_map_range()`, and `cpu_preserved_map_buffer()`.
+  - Remove `cpu_preserved_transition_as`, `transition_as` in
+    `struct cpu_preserved_global_ser`, `arch_cpu_preserved_set_transition_as()`,
+    `x86_caretaker_pgd_pa`, and `arm64_caretaker_pgd_pa`.
+- **Eliminate the redundant `struct cpu_preserved_as` host wrapper**:
+  - Operate directly on `struct cpu_preserved_as_ser` (where the root PGD PA is
+    `pgtable_pages[0]` and its host VA during outgoing PTE construction is
+    `phys_to_virt(pgtable_pages[0])`).
+  - Replace `cpu_preserved_as_adopt()` and `cpu_preserved_as_destroy()` with
+    explicit outgoing `cpu_preserved_as_unpreserve()` and incoming
+    `cpu_preserved_as_restore_free()` helpers on `struct cpu_preserved_as_ser *`
+    so the incoming kernel frees `pgtable_pages[]` directly in `.finish()`.
+- **Rename `struct cpu_preserved_file_ser` to `struct cpu_preserved_ser`, move
+  per-CPU state into it and `struct cpu_preserved_stack_context`, and drop
+  global `pcpus_ser` and `pcpus` arrays from isolated runtime**:
+  - Rename `struct cpu_preserved_file_ser` to `struct cpu_preserved_ser`, move
+    `u32 state` (`CPU_PRESERVED_PARKED`, `CPU_PRESERVED_WORKLOAD`,
+    `CPU_PRESERVED_EXITING`, `CPU_PRESERVED_DEAD`) and
+    `DECLARE_KHOSER_PTR(as, struct cpu_preserved_as_ser *)` directly into it,
+    and remove `struct cpu_preserved_pcpu_ser`, `pcpus_runtime` in
+    `struct cpu_preserved_global_ser`, and `cpu_preserved_pcpus_va` in
+    `.data.cpu_preserved`.
+  - Add `struct cpu_preserved_ser *ser` and `void (*entry_fn)(void *data)` to
+    `struct cpu_preserved_stack_context` at the base of the KHO-preserved
+    stack, and map `ser` only into that CPU's owning session address space.
+  - Have `cpu_preserved_park_loop()`, `cpu_preserved_should_exit()`, and
+    `cpu_preserved_set_dead()` read and update `ser->state` and `entry_fn`
+    directly via `cpu_preserved_get_stack_context()`, and stop mapping the
+    unpreserved `outgoing->pcpus` (`struct cpu_preserved_pcpu`) array into the
+    isolated page tables.
+- **Unify preserved stack size to `THREAD_SIZE` (16KB)**:
+  - Drop `ARCH_CPU_PRESERVED_STACK_ORDER` from
+    `arch/x86/include/asm/cpu_preserve.h` and
+    `arch/arm64/include/asm/cpu_preserve.h` (where ARM64 used
+    `THREAD_SIZE_ORDER + 1`), and define `CPU_PRESERVED_STACK_SIZE` as
+    `THREAD_SIZE` directly in `include/linux/cpu_preserve.h`.
+
+## 9. Tickless 1:1 Execution in `oncore` When No Other Jobs Are Waiting
+
+Currently, `oncore_cpu_schedule_loop()` (`kernel/liveupdate/oncore.c`) always
+computes a 10ms `deadline` and the Caretaker always calls `ops->arm_timer()`,
+causing dedicated 1:1 vCPUs (`M <= N`, `READ_ONCE(rq->nr_runnable) == 0`) to
+take a preemption-timer VM-exit and run `detach_serialize()` every 10ms even
+when no other jobs are waiting on the runqueue:
+
+- In `oncore_cpu_schedule_loop()`, pass `deadline = U64_MAX` when
+  `READ_ONCE(rq->nr_runnable) == 0`, and only compute a finite hardware counter
+  deadline (`now + quantum_ticks`) when `READ_ONCE(rq->nr_runnable) > 0`.
+- In `oncore_sched_enqueue()`, ensure that if a new job is enqueued while CPUs
+  in the session are already running tickless jobs (`deadline == U64_MAX`), an
+  IPI (`arch_cpu_preserved_kick()`) is sent so a running CPU exits guest mode
+  and switches to time-sliced multiplexing.
+- In `kvm_caretaker_run_loop()` (`virt/kvm/caretaker.c`), skip
+  `ops->arm_timer(vcpu, deadline_ticks)` and `ops->disarm_timer(vcpu)` when
+  `deadline_ticks == U64_MAX` (and clear `PIN_BASED_VMX_PREEMPTION_TIMER` in
+  VMX when `deadline_ticks == U64_MAX`).
+
 ---
 
-## Already Implemented Since RFCv1
+## Post-RFCv2
 
-1. **Map Session Buffers into Per-Session `cpu_preserved_as`**:
-   - `oncore_session_map_range()` (`kernel/liveupdate/oncore.c`) maps buffers
-     into `sess->as` via `cpu_preserved_as_map()` when `sess && sess->as` is
-     valid instead of falling back to the global `cpu_preserved_map_range()`.
-   - `kvm_arch_vcpu_caretaker_preserve()` (`arch/x86/kvm/caretaker.c`) maps
-     `struct kvm_vcpu_arch_ser *state` into the session's isolated address space
-     via `oncore_session_map_buffer(sess, state, size)`.
-2. **Preserve `kvmclock` and Refresh `MSR_IA32_TSC` Across `kexec` on x86**:
-   - Added `struct kvm_clock_data clock` to `struct kvm_vcpu_arch_ser`
-     (`include/linux/kho/abi/kvm_x86.h`) and exposed in-kernel `get_kvmclock()`
-     and `kvm_set_clock()` helpers (`arch/x86/kvm/x86.c`).
-   - `kvm_arch_vcpu_luo_preserve()` and `kvm_arch_vcpu_luo_retrieve()`
-     (`arch/x86/kvm/kvm_luo.c`) save and restore `kvmclock` state and restore
-     `MSR_IA32_TSC` and `MSR_IA32_TSC_ADJUST` across Caretaker retrieval.
-   - `vmx_caretaker_post_exit()` (`arch/x86/kvm/vmx/caretaker.c`) and
-     `svm_caretaker_detach_serialize()` (`arch/x86/kvm/svm/caretaker.c`) refresh
-     `MSR_IA32_TSC` in `state->msrs[]` (`rdtsc() + tsc_offset`) at exit time so
-     `kvm_synchronize_tsc()` on retrieve computes the preserved `tsc_offset`
-     instead of a stale pre-`kexec` timestamp.
+### 1. VMM-Only Live Update Using LUO + OrphanVM
+
+Investigate how to live-update the userspace VMM process without performing a
+host `kexec` reboot while keeping guest vCPUs executing in the Caretaker:
+
+- Determine whether the old VMM needs to pass its existing `vmfd`, `vcpufd`, and
+  `memfd`/`guest_memfd` descriptors (or the LUO session descriptor) to the new
+  VMM process, or whether LUO can allow retrieving preserved file descriptors
+  back on cancel / same-kernel session retrieval.
+- Note that upstream KVM binds `struct kvm` to the creating process's
+  `struct mm_struct` (`kvm->mm != current->mm` returns `-EIO` in
+  `kvm_vm_ioctl()` and `kvm_vcpu_ioctl()`), so a new VMM process with a new
+  `mm_struct` either needs fresh `vmfd`/`vcpufd` instances created via LUO
+  retrieve (`LIVEUPDATE_SESSION_RETRIEVE_FD`) or explicit `kvm->mm` rebinding.
