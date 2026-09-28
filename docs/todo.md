@@ -106,6 +106,44 @@ arithmetic (`(void *)&state->msrs[state->num_msrs]`), and ARM64
   `struct kvm_arm64_sysregs_ser` (on ARM64) within a single contiguous
   `kho_alloc_preserve(size)` allocation so there is zero extra page overhead.
 
+## 7. Defer Secondary Page Tables and `vm_token` Lookup to `.freeze()`
+
+Currently, secondary page tables (`struct kvm_kho_folios_ser`) are walked and
+passed to `kho_preserve_folio()` during `LIVEUPDATE_SESSION_PRESERVE_FD(vmfd)`
+(`kvm_luo_preserve()` -> `kvm_arch_vm_luo_preserve()`), and
+`kvm_vcpu_luo_preserve()` calls `liveupdate_get_token_outgoing()` during
+`.preserve()`:
+
+- Calling `liveupdate_get_token_outgoing()` in `kvm_vcpu_luo_preserve()` forces
+  `vmfd` to be preserved before `vcpufd`s (unlike `guest_memfd`, which defers
+  `liveupdate_get_token_outgoing()` to `kvm_gmem_luo_freeze()`).
+- Preserving secondary page tables in `kvm_luo_preserve()` runs while vCPUs may
+  still be executing in `KVM_RUN`, allowing new TDP / Stage-2 page-table pages
+  to be faulted in (which are then missed by KHO preservation) or existing
+  page-table pages to be zapped and freed back to the buddy allocator while
+  still marked preserved in KHO.
+- On x86 (`arch/x86/kvm/mmu/kho.c`), `kvm_mmu_collect_all()` collects raw
+  `struct page *` pointers without deduplicating (e.g., when
+  `vcpu->arch.mmu == &vcpu->arch.guest_mmu`), which can record duplicate PFNs in
+  `folios_pa[]` and trigger `WARN_ON_ONCE(info.magic != KHO_PAGE_MAGIC)` on the
+  second `kho_restore_free()` call during `kvm_kho_folios_finish()`.
+- On ARM64 (`arch/arm64/kvm/kvm_luo.c`), `kvm_arch_vm_luo_preserve()` walks
+  `mmu->pgt` without holding `kvm->mmu_lock` and calls `kho_preserve_folio()`
+  (which may sleep) directly inside `stage2_kho_visitor()`.
+- **Fix for RFCv2**:
+  - Move `liveupdate_get_token_outgoing()` from `kvm_vcpu_luo_preserve()` to
+    `kvm_vcpu_luo_freeze()` (matching `kvm_gmem_luo_freeze()`), allowing `vmfd`
+    and `vcpufd`s to be preserved in any order and verifying the dependency at
+    `.freeze()` time.
+  - Move secondary page table walking and `kho_preserve_folio()` from
+    `kvm_luo_preserve()` to `kvm_luo_freeze()` (`kvm_arch_vm_luo_freeze()`). At
+    `.freeze()` time, all `vcpufd`s are already preserved and detached from
+    `KVM_RUN`, so secondary page tables are quiescent and live-update
+    cancellation before `kexec` avoids unnecessary page-table walks.
+  - Deduplicate collected page-table folios and use the two-phase collect (under
+    `mmu_lock`) + `kho_preserve_folio()` (outside `mmu_lock`) pattern on both
+    x86 and ARM64.
+
 ---
 
 ## Already Implemented Since RFCv1

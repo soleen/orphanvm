@@ -1,4 +1,4 @@
-# Orphaned Virtual Machines: In-Kernel CPU Preservation and Caretaker
+# Orphaned Virtual Machines: The Caretaker approach for Live Update
 
 **Authors:** Pasha Tatashin, `<add-names>`
 **Contributors:** `<add-names>`
@@ -194,7 +194,8 @@ KVM and LUO file descriptor preservation ioctls:
    While the VM is running, the VMM preserves its resources into a LUO session
    via `LIVEUPDATE_SESSION_PRESERVE_FD`:
    - Guest memory `memfd` or `guest_memfd` descriptors
-   - `vmfd`, preserving KVM metadata and secondary page tables
+   - `vmfd`, registering the VM with the LUO session and allocating
+     `struct kvm_luo_ser`
    - (Optional) Physical CPU descriptors
      (`/sys/devices/system/cpu/cpu<N>/preserve`), preserving them into the LUO
      session, which removes the target physical CPUs from the host scheduler and
@@ -225,9 +226,13 @@ KVM and LUO file descriptor preservation ioctls:
    into the outgoing `struct kvm_vcpu`, and any preserved physical CPUs return
    to the host scheduler so the VMM can resume `KVM_RUN`.
 4. **The Kexec Gap**:
-   The host performs a `kexec` reboot. Management CPUs reboot into the incoming
-   kernel while the preserved physical CPUs (`!cpu_present`) continue executing
-   guest vCPUs inside the Caretaker's isolated address space.
+   The host performs a `kexec` reboot. During `liveupdate_reboot()`, LUO invokes
+   `.freeze()` (`luo_freeze()`) across all preserved resources, verifying
+   cross-FD dependencies (`vm_token` for `guest_memfd` and `vcpufd`) and walking
+   and KHO-preserving the VM's quiescent secondary page tables
+   (`kvm_luo_freeze()`). Management CPUs then reboot into the incoming kernel
+   while the preserved physical CPUs (`!cpu_present`) continue executing guest
+   vCPUs inside the Caretaker's isolated address space.
 5. **Reclamation**:
    Once the incoming kernel boots, the new VMM instance opens the preserved LUO
    session and issues `LIVEUPDATE_SESSION_RETRIEVE_FD` for the
@@ -353,16 +358,19 @@ In this proposal, `vcpufd` is preserved into a LUO session, governed by the
 
 ### 3.2 Secondary Page Table Preservation
 
-During the `kexec` blackout window, the host KVM MMU fault handler is offline.
-For the guest to continue accessing its memory without triggering faults
-(Intel EPT Violations, AMD NPT faults, or ARM64 Stage-2 translation faults),
-the existing secondary page tables must remain intact in physical memory across
-`kexec`.
+Once a VM is running in Caretaker mode, secondary page faults are not currently
+supported. For the guest to continue accessing its memory without triggering
+faults (Intel EPT Violations, AMD NPT faults, or ARM64 Stage-2 translation
+faults) that would stall the vCPU until it is retrieved after the reboot, the
+existing secondary page tables must be preserved.
 
 Because secondary page tables are a VM-wide resource shared across all vCPUs,
-they are preserved once when `vmfd` is preserved. `kvm_luo_preserve()`
-serializes the VM type and a KHO pointer to the preserved folio list
-(`struct kvm_kho_folios_ser`) into `struct kvm_luo_ser`:
+they are associated with `vmfd`. This proposal extends `struct kvm_luo_ser`
+(introduced by the `guest_memfd` preservation series, where `type` records the
+`KVM_CREATE_VM` machine type argument, such as a regular vs.
+protected/confidential VM on x86 and IPA size / protected mode on ARM64) with a
+KHO pointer (`kho_folios`) to the preserved secondary page table folio list
+(`struct kvm_kho_folios_ser`):
 
 ```c
 struct kvm_kho_folios_ser {
@@ -371,27 +379,20 @@ struct kvm_kho_folios_ser {
 };
 
 struct kvm_luo_ser {
-        u64 type;
+        u64 type;                                  /* KVM_CREATE_VM type */
         DECLARE_KHOSER_PTR(kho_folios, struct kvm_kho_folios_ser *);
 };
 ```
 
-Each architecture walks its secondary page tables during `vmfd` preservation to
-populate `folios_pa[]`:
-
-- **x86 (`arch/x86/kvm/mmu/kho.c`)**:
-  `kvm_mmu_preserve_kho()` collects all TDP root and non-leaf page-table pages
-  (`kvm->arch.tdp_mmu_roots`), active MMU pages (`kvm->arch.active_mmu_pages`),
-  and per-vCPU root page tables. Because `kho_preserve_folio()` may allocate
-  memory and sleep, preservation runs in two phases: first collecting the
-  `struct page *` pointers while holding `kvm->mmu_lock` for write, and then
-  allocating `struct kvm_kho_folios_ser` and invoking `kho_preserve_folio()`
-  outside `mmu_lock`.
-- **ARM64 (`arch/arm64/kvm/kvm_luo.c`)**:
-  `kvm_arch_vm_luo_preserve()` preserves the Stage-2 PGD root folio
-  (`mmu->pgd_phys`) and walks the guest's Stage-2 page table (`mmu->pgt`) via
-  `kvm_pgtable_walk()` (`KVM_PGTABLE_WALK_TABLE_PRE`), preserving every valid
-  non-leaf table folio in `struct kvm_kho_folios_ser`.
+While `struct kvm_luo_ser` is allocated when `vmfd` is preserved into the LUO
+session, walking and KHO-preserving the secondary page tables is deferred to the
+`.freeze()` phase (`kvm_luo_freeze()`). Because `vmfd` and `vcpufd`s can be
+preserved in any order (with `vm_token` dependencies resolved during
+`.freeze()`), vCPUs may still be executing in `KVM_RUN` and faulting in or
+zapping secondary page tables when `vmfd` `.preserve()` is called. By
+`.freeze()` time (`reboot(LINUX_REBOOT_CMD_KEXEC)`), all `vcpufd`s have been
+preserved and detached from host `KVM_RUN`, so the secondary page tables are
+quiescent.
 
 ### 3.3 LUO Lifecycle: Freeze, Cancellation, Retrieve, and Finish
 
@@ -400,26 +401,30 @@ Across a live update, the LUO file handlers for guest memory (`memfd_luo.c`,
 (`kvm_vcpu_luo_file_ops`) coordinate four lifecycle transitions:
 
 1. **Pre-`kexec` `.freeze()` Phase (`luo_freeze()`)**:
-   When `reboot(LINUX_REBOOT_CMD_KEXEC)` executes, `liveupdate_reboot()` invokes
-   `luo_freeze()` before jumping to the incoming kernel:
-   - **Guest Memory (`memfd` and `guest_memfd`)**: During
-     `LIVEUPDATE_SESSION_PRESERVE_FD`, `memfd_luo_preserve()` freezes the shmem
-     inode (`shmem_freeze(inode, true)`) and pins `VM_SHARED` VMA mappings
-     (`mm_liveupdate_pin_vmas()`), while `kvm_gmem_luo_preserve()` sets
-     `KVM_GMEM_FLAG_PRESERVED` (blocking `fallocate` and punch-hole operations)
-     so already-allocated guest RAM can continue to be accessed and dirtied up
-     until `kexec`. At `kexec` time, `memfd_luo_freeze()`
-     (`memfd_luo_save_folios()`) walks the inode's page cache
-     (`filemap_get_folios_contig()`), cleans dirty folios (`folio_mkclean()`),
-     calls `kho_preserve_folio()` on each allocated folio, and records their
-     PFNs in `struct memfd_luo_folio_ser`. Similarly, `kvm_gmem_luo_freeze()`
-     walks the `guest_memfd` page cache, records each folio's PFN and
-     preparation state (`KVM_GMEM_SER_PREPARED`), and preserves each folio via
-     `kho_preserve_folio()`.
-   - **KVM (`vmfd` and `vcpufd`)**: Neither `kvm_luo_file_ops` nor
-     `kvm_vcpu_luo_file_ops` defines a `.freeze()` callback because the
-     secondary page tables and vCPU architectural/Caretaker state are already
-     preserved in KHO memory when `LIVEUPDATE_SESSION_PRESERVE_FD` completes.
+   Userspace can preserve `memfd`/`guest_memfd`, `vmfd`, and `vcpufd`s into a
+   LUO session in any order via `LIVEUPDATE_SESSION_PRESERVE_FD`. When
+   `reboot(LINUX_REBOOT_CMD_KEXEC)` executes, `liveupdate_reboot()` invokes
+   `luo_freeze()` across all preserved files before jumping to the incoming
+   kernel:
+   - **Guest Memory (`memfd` and `guest_memfd`)**: During `.preserve()`,
+     `memfd_luo_preserve()` freezes the shmem inode (`shmem_freeze(inode,
+     true)`) and pins and KHO-preserves its folios
+     (`memfd_luo_preserve_folios()`), while `kvm_gmem_luo_preserve()` freezes
+     the inode (`kvm_gmem_freeze(inode, true)`) and walks and KHO-preserves its
+     allocated folios (`kvm_gmem_luo_walk_folios()`) so the guest can continue
+     reading and writing existing mapped pages across `kexec`. At `.freeze()`
+     time, `memfd_luo_freeze()` snapshots the updated file position
+     (`ser->pos`), and `kvm_gmem_luo_freeze()` resolves `ser->vm_token` via
+     `liveupdate_get_token_outgoing()` to verify that the parent `vmfd` was also
+     preserved in the session.
+   - **`vmfd` (`kvm_luo_freeze()`)**: Walks the VM's quiescent secondary page
+     tables (`kvm_arch_vm_luo_freeze()`), preserves each page-table folio via
+     `kho_preserve_folio()`, and stores the resulting
+     `struct kvm_kho_folios_ser` pointer in `ser->kho_folios`.
+   - **`vcpufd` (`kvm_vcpu_luo_freeze()`)**: Resolves `ser->vm_token` via
+     `liveupdate_get_token_outgoing()` (matching `kvm_gmem_luo_freeze()`) so
+     `vcpufd` and `vmfd` can be preserved in any order during
+     `LIVEUPDATE_SESSION_PRESERVE_FD`.
 2. **Cancellation (`.unpreserve()`) Before `kexec`**:
    If the LUO session file descriptor is closed before `kexec`
    (`luo_session_release()` -> `luo_file_unpreserve_files()`), LUO invokes
@@ -431,10 +436,10 @@ Across a live update, the LUO file handlers for guest memory (`memfd_luo.c`,
      (`kho_unpreserve_free()`). Because non-architectural host state (such as
      memslots, secondary page tables, and device bindings) remained in place in
      the outgoing kernel, the VMM can immediately resume `KVM_RUN`.
-   - **`vmfd` (`kvm_luo_unpreserve()`)**: Unpreserves the secondary page table
-     folios in KHO (`kvm_kho_folios_unpreserve()` -> `kho_unpreserve_folio()`,
-     leaving the live page tables intact in the outgoing `struct kvm`) and frees
-     `struct kvm_luo_ser`.
+   - **`vmfd` (`kvm_luo_unpreserve()`)**: Unpreserves any secondary page table
+     folios in `ser->kho_folios` (if `.freeze()` ran) and frees
+     `struct kvm_luo_ser`, leaving the live page tables intact in the outgoing
+     `struct kvm`.
    - **`memfd` / `guest_memfd` (`memfd_luo_unpreserve()` /
      `kvm_gmem_luo_unpreserve()`)**: Unfreezes the inode
      (`shmem_freeze(inode, false)` or clearing `KVM_GMEM_FLAG_PRESERVED`),
