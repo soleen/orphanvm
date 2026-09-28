@@ -250,6 +250,30 @@ when no other jobs are waiting on the runqueue:
   `deadline_ticks == U64_MAX` (and clear `PIN_BASED_VMX_PREEMPTION_TIMER` in
   VMX when `deadline_ticks == U64_MAX`).
 
+## 10. Preserve Posted Interrupt Tables (`pid_table`, `pi_desc`) for Intel IPIv
+
+On Intel CPUs with IPI virtualization (`TERTIARY_EXEC_IPI_VIRT`), `vmcs01` keeps
+hardware APICv and IPIv enabled during Caretaker execution so guest `X2APIC_ICR`
+writes are handled in silicon without VM-exits (`stall_count == 0`). However,
+while `kvm_x86_caretaker_init_common_page()` (`arch/x86/kvm/caretaker.c`)
+already KHO-preserves the virtual-APIC page (`vcpu->arch.apic->regs`,
+`VIRTUAL_APIC_PAGE_ADDR`), `VMCS.PID_POINTER_TABLE` (`kvm_vmx->pid_table`) and
+`VMCS.POSTED_INTR_DESC_ADDR` (`&vmx->vt.pi_desc`) still point to unpreserved
+outgoing kernel memory, and `vmx_caretaker_init_host_vmcs()` clears
+`PIN_BASED_POSTED_INTR`:
+
+- KHO-preserve `kvm_vmx->pid_table` (`PID_POINTER_TABLE`) and place each vCPU's
+  64-byte aligned `struct pi_desc` (`POSTED_INTR_DESC_ADDR`) in KHO-preserved
+  memory (such as `struct caretaker_vmx_page`, updating `POSTED_INTR_DESC_ADDR`
+  and `pid_table[vcpu_id]`) so hardware IPIv never writes to unpreserved pages
+  during `kexec`.
+- Keep `PIN_BASED_POSTED_INTR` enabled in `vmx_caretaker_init_host_vmcs()`, set
+  `pi_desc->ndst` to the Caretaker physical CPU's APIC ID with `pi_desc->sn = 0`
+  in `vmx_caretaker_pre_enter()` (and `pi_desc->sn = 1` in
+  `vmx_caretaker_post_exit()`), and sync pending `pi_desc->pir` vectors into
+  `VIRR` and `GUEST_INTR_STATUS` (`RVI`) on VM-entry and upon host reclaim in
+  `vmx_caretaker_sync_vcpu()`.
+
 ---
 
 ## Post-RFCv2

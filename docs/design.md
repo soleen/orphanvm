@@ -730,72 +730,90 @@ Each preserved physical CPU in an `oncore_session` executes
 
 ---
 
-## 6. Layer 4: KVM Caretaker Architecture (`caretaker`)
+## 6. Layer 4: KVM Caretaker
 
-The KVM Caretaker engine (`virt/kvm/caretaker.c`,
-`include/linux/kvm_caretaker.h`, `CONFIG_KVM_CARETAKER`) bridges KVM `vcpufd`
-preservation (Layer 1) with the `oncore` scheduler (Layer 3).
+The KVM Caretaker is an isolated in-kernel agent that runs Orphaned VM vCPUs
+and handles their VM-exits while the host kernel is torn down across `kexec`.
+Running as an `oncore` workload in `.text.cpu_preserved`, it takes temporary
+ownership of the vCPU's hardware virtualization context (`VMCS`, `VMCB`, or EL2
+system registers), enters guest mode, services any intercepts or quantum timer
+exits that can be resolved without host kernel services, and returns control
+to `oncore` upon quantum expiration, guest idle, an unhandled VM-exit
+(`ONCORE_EXIT_STALL`), or host kernel reclamation.
 
-When `CONFIG_KVM_CARETAKER` (`KVM_CAP_CARETAKER`) is supported and a `vcpufd` is
-preserved into a LUO session that also contains preserved physical CPUs:
+When `CONFIG_KVM_CARETAKER` (`KVM_CAP_CARETAKER`) is enabled and a `vcpufd` is
+preserved into a LUO session:
 
-1. `kvm_caretaker_vcpu_pre_preserve()` allocates a `struct oncore_job` for
-   `kvm_arch_vcpu_caretaker_run()` on the session.
-2. `kvm_arch_vcpu_luo_preserve()` serializes the vCPU's architectural state into
-   `struct kvm_vcpu_arch_ser`, initializes the architecture Caretaker runtime
-   page (`kvm_caretaker_init_common_vcpu()`, setting `cb->state` to
-   `KVM_CARETAKER_PAUSED` and populating `ser->cb`), and maps the runtime page
-   and `arch_state` buffer into the session's isolated address space
+1. **Job Creation**: `kvm_caretaker_vcpu_pre_preserve()` allocates a
+   `struct oncore_job` on the session for `kvm_arch_vcpu_caretaker_run()`.
+2. **State and Runtime Initialization**: `kvm_arch_vcpu_luo_preserve()`
+   serializes architectural state into `struct kvm_vcpu_arch_ser`, initializes
+   the Caretaker runtime page in `KVM_CARETAKER_PAUSED` (`ser->cb`), and maps
+   both into the session's isolated address space
    (`struct cpu_preserved_as_ser`).
-3. `kvm_caretaker_vcpu_post_preserve()` binds `cb` to the job and calls
-   `oncore_session_activate_job()`, queuing the job on the `oncore_runqueue`:
-   if an idle preserved physical CPU is parked in `cpu_preserved_park_loop()`,
-   `oncore_session` attaches to it and kicks it so the vCPU immediately resumes
-   guest execution; if all preserved CPUs in the session are already running
-   vCPU jobs, the job is time-sliced across them; and if no physical CPUs are
-   available in the LUO session, the vCPU remains suspended until CPUs are
-   added.
+3. **Activation**: `kvm_caretaker_vcpu_post_preserve()` activates the job on the
+   `oncore` runqueue (`oncore_session_activate_job()`), waking an idle preserved
+   CPU to resume the vCPU immediately (or queuing it until a preserved CPU in
+   the session is available).
 
-### 6.1 Cross-Kexec ABI Invariant vs. Private Runtime Pages
+### 6.1 KVM Caretaker Control Block ABI
 
-A design rule in RFCv1 is that **the incoming kernel must never read or depend
-on outgoing-kernel internal structures**. Only structures defined in
-`include/linux/kho/abi/` may cross the `kexec` boundary:
+For each vCPU running under the Caretaker, `struct kvm_vcpu_ser` (`ser->cb`)
+points to a KHO-preserved Caretaker control block defined in
+`include/linux/kho/abi/kvm.h` (`kvm_x86.h`, `kvm_arm64.h`):
 
-- **Cross-Kernel KHO ABI (`include/linux/kho/abi/kvm.h`, `kvm_x86.h`,
-  `kvm_arm64.h`)**:
-  - `struct kvm_caretaker_cb_ser` coordinates the execution state (`state`,
-    `enum kvm_caretaker_state`), the physical CPU ID (`pcpu_id`), `vcpu_id`,
-    and the KHO pointer (`telemetry`) to `struct kvm_caretaker_telemetry_ser`:
+1. **Common Control Block (`struct kvm_caretaker_cb_ser`)**:
+   Coordinates the cross-kernel execution state (`state`,
+   `enum kvm_caretaker_state`), the assigned physical CPU ID (`pcpu_id`),
+   `vcpu_id`, and the KHO pointer (`telemetry`) to
+   `struct kvm_caretaker_telemetry_ser`:
 
-    ```c
-    struct kvm_caretaker_cb_ser {
-            u32 state;
-            u32 pcpu_id;
-            u32 vcpu_id;
-            DECLARE_KHOSER_PTR(telemetry, struct kvm_caretaker_telemetry_ser *);
-    };
-    ```
+   ```c
+   struct kvm_caretaker_cb_ser {
+           u32 state;
+           u32 pcpu_id;
+           u32 vcpu_id;
+           DECLARE_KHOSER_PTR(telemetry, struct kvm_caretaker_telemetry_ser *);
+   };
+   ```
 
-  - `struct kvm_caretaker_arch_ser`: Contains `struct kvm_caretaker_cb_ser cb`
-    at offset 0, plus only the minimal architecture fields required by the
-    incoming kernel during hardware state adoption (such as `apic_id`,
-    `vmcs_pa`, and `preserved_pages_pa[]` on x86, or `cntvoff_el2`, `hcr_el2`,
-    `mdcr_el2`, and VGICv3 CPU interface registers on ARM64).
-- **Outgoing-Kernel Private Runtime Page**:
-  Each architecture allocates a KHO-preserved runtime context page (`struct
-  caretaker_x86_page`, `struct caretaker_vmx_page`, `struct caretaker_svm_page`,
-  or `struct caretaker_arm64_page`) that is mapped into the `oncore_session`'s
-  isolated address space (`struct cpu_preserved_as_ser`).
-  This page embeds `struct kvm_caretaker_arch_ser abi` at **offset 0**,
-  while the rest of the page holds private runtime state (saved host registers,
-  standalone GDT/IDT/TSS, exception stacks, scratch variables) that is accessed
-  *exclusively* by the outgoing kernel's `.text.cpu_preserved` code. When the
-  incoming kernel boots, it resolves `ser->cb` only to
-  `struct kvm_caretaker_cb_ser *` (or `struct kvm_caretaker_arch_ser *`) and
-  frees the raw page once the vCPU transitions to `KVM_CARETAKER_STOPPED`.
+2. **Architecture Control Block (`struct kvm_caretaker_arch_ser`)**:
+   Embeds `struct kvm_caretaker_cb_ser cb` at offset 0, followed by the minimal
+   architecture fields needed by the incoming kernel during hardware state
+   adoption:
 
-### 6.2 Cross-Kernel State Machine
+   - **x86 (`include/linux/kho/abi/kvm_x86.h`)**:
+
+     ```c
+     struct kvm_caretaker_arch_ser {
+             struct kvm_caretaker_cb_ser cb;
+             u32 apic_id;
+             u32 nr_preserved_pages;
+             u64 vmcs_pa;
+             u64 preserved_pages_pa[KVM_X86_CARETAKER_MAX_PAGES];
+     };
+     ```
+
+   - **ARM64 (`include/linux/kho/abi/kvm_arm64.h`)**:
+
+     ```c
+     struct kvm_caretaker_arch_ser {
+             struct kvm_caretaker_cb_ser cb;
+             u32 vgic_initialized;
+             u32 cflags;
+             u64 cntvoff_el2;
+             u64 hcr_el2;
+             u64 mdcr_el2;
+             u32 used_lrs;
+             u32 vgic_hcr;
+             u32 vgic_vmcr;
+             u32 vgic_ap0r[4];
+             u32 vgic_ap1r[4];
+             u64 vgic_lr[16];
+     };
+     ```
+
+### 6.2 Orphaned VM State Machine
 
 Handoff between the preserved physical CPU (running the outgoing kernel's
 `.text.cpu_preserved` code) and the host kernel reclaiming the vCPU (either the
@@ -836,117 +854,66 @@ via atomic `cmpxchg()` transitions on `cb->state`:
     +------------------------------------------------------------------+
 ```
 
-A key invariant of this state machine is **proactive serialization at quantum
-boundaries**:
+Whenever the Caretaker pauses a vCPU (upon quantum expiration, guest idle, or an
+unhandled exit), it flushes live hardware registers into `ser->arch_state`
+(`detach_serialize()`) before setting `cb->state = KVM_CARETAKER_PAUSED`. As a
+result, `ser->arch_state` in RAM is always up to date whenever `cb->state` is
+`PAUSED`:
 
-- Before transitioning from `KVM_CARETAKER_RUNNING` to `KVM_CARETAKER_PAUSED`
-  (whether due to `oncore` quantum expiration, `ONCORE_EXIT_YIELD_IDLE`, or
-  `ONCORE_EXIT_STALL`), the preserved CPU invokes the architecture's
-  `detach_serialize()` routine (`ops->detach_serialize()` on x86,
-  `arm64_caretaker_detach_serialize()` on ARM64), flushing live hardware
-  registers back into the `struct kvm_vcpu_arch_ser` buffer before publishing
-  `KVM_CARETAKER_PAUSED`.
-- Therefore, whenever `cb->state == KVM_CARETAKER_PAUSED`, `ser->arch_state` is
-  guaranteed to hold the complete, up-to-date architectural state of the vCPU.
-- When the reclaiming kernel calls `kvm_caretaker_wait_for_attach()`:
-  - **Fast Path (`PAUSED -> STOPPED`)**: If `cb->state` is `PAUSED`, a single
-    `cmpxchg(&cb->state, KVM_CARETAKER_PAUSED, KVM_CARETAKER_STOPPED)` claims
-    the vCPU immediately without waiting for or kicking any physical CPU. When
-    the `oncore` scheduler next invokes the job, it observes `STOPPED` and
-    returns `ONCORE_EXIT_ATTACH_SIGNALED`.
-  - **Active Path (`RUNNING -> STOPPING -> STOPPED`)**: If `cb->state` is
-    `RUNNING`, the reclaiming kernel executes
-    `cmpxchg(&cb->state, KVM_CARETAKER_RUNNING, KVM_CARETAKER_STOPPING)` and
-    sends a physical IPI (`arch_cpu_preserved_kick(pcpu)`). The IPI forces an
-    immediate VM-exit on the preserved CPU; the Caretaker loop observes
-    `STOPPING` (`kvm_caretaker_should_exit()`), runs `detach_serialize()`,
-    publishes `KVM_CARETAKER_STOPPED`, and returns
-    `ONCORE_EXIT_ATTACH_SIGNALED`.
+- **Reclaiming a `PAUSED` vCPU (`PAUSED -> STOPPED`)**:
+  `kvm_caretaker_wait_for_attach()` claims the vCPU immediately with a single
+  `cmpxchg(&cb->state, KVM_CARETAKER_PAUSED, KVM_CARETAKER_STOPPED)` without
+  kicking or waiting for any physical CPU.
+- **Reclaiming a `RUNNING` vCPU (`RUNNING -> STOPPING -> STOPPED`)**:
+  `kvm_caretaker_wait_for_attach()` sets
+  `cmpxchg(&cb->state, KVM_CARETAKER_RUNNING, KVM_CARETAKER_STOPPING)` and sends
+  a physical IPI (`arch_cpu_preserved_kick(pcpu)`). The IPI forces a VM-exit on
+  the preserved CPU, which flushes its hardware state via `detach_serialize()`,
+  sets `cb->state = KVM_CARETAKER_STOPPED`, and exits to `oncore`.
 
-Both live-update cancellation and incoming-kernel reclamation use this state
-machine to hand the vCPU back to host KVM:
+Both live-update cancellation and incoming-kernel reclamation use this handshake
+to return the vCPU to host KVM:
 
-- **Cancellation in the Outgoing Kernel (`kvm_caretaker_vcpu_unpreserve()`)**:
-  When the LUO session file descriptor is closed before `kexec`,
-  `kvm_caretaker_vcpu_unpreserve()` invokes
-  `kvm_arch_vcpu_luo_pre_retrieve_caretaker()`
-  (`kvm_caretaker_wait_for_attach()`) to transition `cb->state` to
-  `KVM_CARETAKER_STOPPED`, restores the updated architectural state
-  (`struct kvm_vcpu_arch_ser`) and hardware control state back into the outgoing
-  kernel's existing `struct kvm_vcpu` (`kvm_arch_vcpu_luo_retrieve()` and
-  `kvm_arch_vcpu_luo_attach_caretaker()`), cancels the `oncore_job`
-  (`oncore_session_cancel_job()`), and unpreserves and frees the Caretaker
-  runtime, hardware, and telemetry pages (`kho_unpreserve_free()`). Because
-  non-architectural host state (memslots, secondary page tables, and device
-  bindings) never left the outgoing kernel's `struct kvm_vcpu`, the VMM can
-  immediately resume `KVM_RUN`.
-- **Reclamation in the Incoming Kernel (`kvm_caretaker_vm_pre_retrieve()`,
-  `kvm_caretaker_vcpu_pre_retrieve()`, `kvm_caretaker_vcpu_retrieve()`, and
-  `kvm_caretaker_vcpu_finish()`)**:
-  1. When `vmfd` is retrieved (`kvm_luo_retrieve()`),
-     `kvm_caretaker_vm_pre_retrieve()` calls `cpu_preserved_detach_workload()`
-     on preserved physical CPUs (`ser->state = CPU_PRESERVED_PARKED` + IPI
-     kick), causing any running Caretaker vCPU to VM-exit, run
-     `detach_serialize()`, publish `KVM_CARETAKER_PAUSED`, and return the
-     physical CPU from `oncore_cpu_schedule_loop()` to
-     `cpu_preserved_park_loop()`.
-  2. When each `vcpufd` is retrieved (`kvm_vcpu_luo_retrieve()`),
-     `kvm_caretaker_vcpu_pre_retrieve()` calls `kvm_caretaker_wait_for_attach()`
-     to transition `cb->state` to `KVM_CARETAKER_STOPPED` (invalidating CPU data
-     caches over `ser->cb` and `ser->arch_state` on ARM64), restores the updated
-     architectural state from `ser->arch_state` (`struct kvm_vcpu_arch_ser`)
-     into the newly allocated `struct kvm_vcpu`
-     (`kvm_arch_vcpu_luo_retrieve()`), and synchronizes hardware control state
-     (`kvm_caretaker_vcpu_retrieve()`).
-  3. When `LIVEUPDATE_SESSION_FINISH` is issued (`kvm_vcpu_luo_finish()` ->
-     `kvm_caretaker_vcpu_finish()`), the kernel ensures `cb->state` has reached
-     `KVM_CARETAKER_STOPPED` (in case `vcpufd` was never retrieved), reports and
-     frees the KHO telemetry buffer, and frees the Caretaker runtime page and
-     per-vCPU preserved hardware pages (`kho_restore_free()`).
+- **Outgoing Cancellation (`kvm_caretaker_vcpu_unpreserve()`)**:
+  If the LUO session is closed before `kexec`, the outgoing kernel transitions
+  `cb->state` to `KVM_CARETAKER_STOPPED`, restores the updated `ser->arch_state`
+  and hardware control state back into the existing `struct kvm_vcpu`, cancels
+  the `oncore` job, and frees the Caretaker pages so the VMM can immediately
+  resume `KVM_RUN`.
+- **Incoming Reclamation (`kvm_vcpu_luo_retrieve()`, `kvm_vcpu_luo_finish()`)**:
+  In the new kernel, retrieving `vmfd` detaches the preserved CPUs back to
+  `cpu_preserved_park_loop()`, retrieving each `vcpufd` transitions `cb->state`
+  to `KVM_CARETAKER_STOPPED` and restores `ser->arch_state` and hardware control
+  state into the new `struct kvm_vcpu`, and `.finish()` frees the preserved
+  Caretaker and telemetry pages.
 
-### 6.3 Architecture Backends in RFCv1
+### 6.3 KVM Caretaker Arch Backends
 
-In RFCv1, each supported architecture implements `struct kvm_caretaker_ops`
-(`enter_guest`, `decode_exit`, `handle_arch_exit`, `advance_rip`, `arm_timer`,
-`disarm_timer`, `pre_run`, and `post_run` in `.text.cpu_preserved`), paired on
-x86 with vendor `struct kvm_x86_caretaker_ops` (`init`, `sync_vcpu`, and
-`runtime->detach_serialize`):
+Each architecture implements `struct kvm_caretaker_ops` in
+`.text.cpu_preserved` to manage guest entry/exit, quantum timers, and state
+serialization:
 
-- **x86 Common (`arch/x86/kvm/caretaker.c`)**:
-  Initializes `struct caretaker_x86_page`, builds standalone GDT, TSS, and IDT
-  tables (`caretaker_x86_idt`, so any NMI or exception in host mode lands in a
-  self-contained handler rather than the torn-down Linux IDT), manages guest FPU
-  state via `XRSTOR64` / `XSAVE64` directly against
-  `state->xsave.region`, and provides `kvm_x86_caretaker_arm_timer()` to program
-  the host local APIC timer (`MSR_IA32_TSC_DEADLINE` or `APIC_TMICT`).
-- **Intel VMX (`arch/x86/kvm/vmx/caretaker.c`, `caretaker_vmenter.S`)**:
-  Preserves `vmcs01` (`vmcs`, `msr_bitmap`, `pml_pg`, `ve_info`) across `kexec`,
-  reprograms `HOST_CR3` to the session's isolated `CR3` (`session_pgd_pa`) and
-  `HOST_RIP` to `vmx_caretaker_exit_handler`, and uses the hardware VMX
-  preemption timer to enforce `oncore` quantum deadlines. Upon adoption in the
-  incoming kernel (`vmx_caretaker_sync_vcpu()`), because `struct loaded_vmcs` is
-  internal to
-  each kernel build, the incoming kernel allocates a new `loaded_vmcs`,
-  temporarily loads the preserved `abi->vmcs_pa` via `vmptrld`, copies the
-  guest-visible VMCS fields (`vmx_caretaker_guest_fields[]`) into the new VMCS,
-  and applies `ser->arch_state`.
-- **AMD SVM (`arch/x86/kvm/svm/caretaker.c`, `caretaker_vmenter.S`)**:
-  Copies `vmcb01` into the preserved `caretaker_svm_page->vmcb` and allocates a
-  dedicated preserved `hsave_area` (`MSR_VM_HSAVE_PA`). Uses the host LAPIC
-  timer combined with `INTERCEPT_INTR` to preempt guest execution at the
-  `oncore` quantum deadline, and synchronizes dirty VMCB save-area fields
-  (`rip`, `rsp`, `rax`, `rflags`, control registers, segment descriptors, and
-  syscall/sysenter MSRs) back into `ser->arch_state` in
-  `svm_caretaker_detach_serialize()`.
-- **ARM64 VHE (`arch/arm64/kvm/caretaker.c`, `caretaker_vmenter.S`)**:
-  Installs a standalone EL2 vector table (`caretaker_hyp_vector` in `VBAR_EL2`),
-  context-switches EL1 system registers, FP/SIMD state, Pointer Authentication
-  keys, Stage-2 MMU registers (`VTCR_EL2`, `VTTBR_EL2`), VGICv3 CPU interface
-  registers (`ICH_LR<n>_EL2`, `ICH_AP*R<n>_EL2`, `ICH_VMCR_EL2`, `ICH_HCR_EL2`),
-  and the virtual timer (`CNTV_CTL_EL0`, `CNTV_CVAL_EL0`). Enforces `oncore`
-  quantums via the EL2 physical timer (`CNTHP_CVAL_EL2` / `CNTHP_CTL_EL2`) and
-  writes dirty hardware state back into `cap->abi` and the `kvm_one_reg` entries
-  of `cap->arch_state` in `arm64_caretaker_detach_serialize()`.
+- **x86 Common**:
+  Sets up standalone GDT, TSS, and IDT tables so host-mode exceptions and
+  interrupts land in self-contained handlers, preserves the virtual-APIC page,
+  and saves/restores guest FPU state in place (`XRSTOR64` / `XSAVE64` on
+  `state->xsave.region`).
+- **Intel VMX**:
+  Preserves `vmcs01` and Posted Interrupt / IPIv tables (`pid_table`,
+  `pi_desc`), reprograms `HOST_CR3` and `HOST_RIP` to the Caretaker's isolated
+  address space and exit handler, and uses the VMX preemption timer for quantum
+  deadlines. On incoming adoption, it copies guest-visible VMCS fields from the
+  preserved `vmcs_pa` into the new kernel's `loaded_vmcs`.
+- **AMD SVM**:
+  Copies `vmcb01` into the preserved Caretaker runtime page with a dedicated
+  `hsave_area` (`MSR_VM_HSAVE_PA`), uses the host LAPIC timer with
+  `INTERCEPT_INTR` for quantum deadlines, and flushes dirty VMCB save-area
+  fields back into `ser->arch_state`.
+- **ARM64 VHE**:
+  Installs a standalone EL2 vector table (`VBAR_EL2`), context-switches EL1
+  system registers, FP/SIMD, Stage-2 MMU (`VTCR_EL2`, `VTTBR_EL2`), VGICv3 CPU
+  interface registers, and the virtual timer, and uses the EL2 physical timer
+  (`CNTHP_CVAL_EL2`) for quantum deadlines.
 
 ### 6.4 Gap Telemetry and Observability
 
@@ -1161,8 +1128,10 @@ discussion:
    delivery) into `vmx_exit_handlers_fastpath()` and
    `svm_exit_handlers_fastpath()` was proposed as a standalone improvement that
    benefits both normal KVM and the Caretaker. In RFCv1, ARM64 emulates
-   `ICC_SGI1R_EL1` in the Caretaker, whereas x86 currently treats x2APIC
-   `APIC_ICR` writes as a blocking exit (`ONCORE_EXIT_STALL`).
+   `ICC_SGI1R_EL1` in the Caretaker and Intel CPUs with IPIv handle x2APIC
+   `APIC_ICR` writes in hardware without VM-exits, whereas x86 without hardware
+   IPI virtualization treats intercepted `APIC_ICR` writes as a blocking exit
+   (`ONCORE_EXIT_STALL`).
 5. **Decoupling Asynchronous vCPU Execution from `kexec` (`KVM_RUN_ASYNC` / VMM
    Upgrade)**:
    Paolo Bonzini and David Woodhouse discussed decoupling detached vCPU
