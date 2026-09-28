@@ -289,54 +289,65 @@ In this proposal, `vcpufd` is preserved into a LUO session, governed by the
     outgoing kernel, the Caretaker, and the incoming kernel.
 
 - **`vcpufd` Architectural State (`struct kvm_vcpu_arch_ser`)**:
-  To avoid modifying common KVM code or defining a separate, complex
-  serialization format, this proposal composes the `vcpufd` arch-specific ABI
-  using existing KVM uAPI structures. Note while uAPI structures are generally
-  stable, they can still evolve over time by expanding layouts. Embedding uAPI
-  structures is therefore not a complete ABI stability guarantee on its own,
-  but combined with LUO ABI versioning (which, as noted in Section 1.2, is
-  developed as an orthogonal effort), any incompatible layout change is
-  detectable and will automatically mark a Live Update between those kernel
-  versions as incompatible:
+  In all other KHO ABI structures, existing kernel `struct`s are never reused;
+  instead, every structure is built exclusively from fixed-width primitive types
+  (`u8`, `u32`, `u64`) or other serialized structures defined under
+  `include/linux/kho/abi/`. For `vcpufd` arch-specific preservation, to avoid
+  modifying common KVM code or defining a separate, complex serialization
+  format, this proposal makes an exception and reuses existing kernel
+  structures. Crucially, *all* reused structures are exposed to uAPI. Note while
+  uAPI structures are generally stable, they can still evolve over time by
+  expanding layouts. Embedding uAPI structures is therefore not a complete ABI
+  stability guarantee on its own, but combined with LUO ABI versioning (which,
+  as noted in Section 1.2, is developed as an orthogonal effort), any
+  incompatible layout change is detectable and will automatically mark a Live
+  Update between those kernel versions as incompatible:
   - **x86 (`include/linux/kho/abi/kvm_x86.h`)**:
 
     ```c
     struct kvm_vcpu_arch_ser {
-            struct kvm_regs regs;
-            struct kvm_sregs sregs;
-            struct kvm_mp_state mp_state;
-            struct kvm_xcrs xcrs;
-            struct kvm_lapic_state lapic;
-            struct kvm_xsave xsave;
-            struct kvm_vcpu_events events;
-            struct kvm_debugregs debugregs;
-            struct kvm_clock_data clock;
-            u32 num_msrs;
-            u32 cpuid_nent;
-            struct kvm_msr_entry msrs[];
+            struct kvm_regs regs;              /* KVM_GET/SET_REGS */
+            struct kvm_sregs sregs;            /* KVM_GET/SET_SREGS */
+            struct kvm_mp_state mp_state;      /* KVM_GET/SET_MP_STATE */
+            struct kvm_xcrs xcrs;              /* KVM_GET/SET_XCRS */
+            struct kvm_lapic_state lapic;      /* KVM_GET/SET_LAPIC */
+            struct kvm_xsave xsave;            /* KVM_GET/SET_XSAVE */
+            struct kvm_vcpu_events events;     /* KVM_GET/SET_VCPU_EVENTS */
+            struct kvm_debugregs debugregs;    /* KVM_GET/SET_DEBUGREGS */
+            struct kvm_clock_data clock;       /* KVM_GET/SET_CLOCK */
+            DECLARE_KHOSER_PTR(msrs,
+                               struct kvm_msrs *);   /* KVM_GET/SET_MSRS */
+            DECLARE_KHOSER_PTR(cpuid,
+                               struct kvm_cpuid2 *); /* KVM_GET/SET_CPUID2 */
     };
     ```
 
     `xsave` is 64-byte aligned so the Caretaker can execute hardware `XSAVE64`
-    and `XRSTOR64` directly in place, and `msrs[num_msrs]` (populated from KVM's
-    `msrs_to_save` and `emulated_msrs` lists) is immediately followed in memory
-    by `cpuid_nent` `struct kvm_cpuid_entry2` entries.
+    and `XRSTOR64` directly in place, while `msrs` (populated from KVM's
+    `msrs_to_save` and `emulated_msrs` lists) and `cpuid` point to the
+    variable-length uAPI `struct kvm_msrs` and `struct kvm_cpuid2` tables
+    allocated within the same contiguous KHO buffer.
 
   - **ARM64 (`include/linux/kho/abi/kvm_arm64.h`)**:
 
     ```c
-    struct kvm_vcpu_arch_ser {
-            struct kvm_regs regs;
-            struct kvm_mp_state mp_state;
-            struct kvm_vcpu_events events;
-            struct kvm_vcpu_init init;
+    struct kvm_arm64_sysregs_ser {
             u32 num_sysregs;
-            struct kvm_one_reg sysregs[];
+            struct kvm_one_reg sysregs[];      /* KVM_GET/SET_ONE_REG */
+    };
+
+    struct kvm_vcpu_arch_ser {
+            struct kvm_regs regs;              /* KVM_GET/SET_ONE_REG */
+            struct kvm_mp_state mp_state;      /* KVM_GET/SET_MP_STATE */
+            struct kvm_vcpu_events events;     /* KVM_GET/SET_VCPU_EVENTS */
+            struct kvm_vcpu_init init;         /* KVM_ARM_VCPU_INIT */
+            DECLARE_KHOSER_PTR(sysregs, struct kvm_arm64_sysregs_ser *);
     };
     ```
 
-    `sysregs[num_sysregs]` stores each system and VGICv3 CPU interface
-    register's `id` and 64-bit value (in `addr`), enumerated via
+    `sysregs` points to `struct kvm_arm64_sysregs_ser` (placed within the same
+    contiguous KHO allocation), which stores each system and VGICv3 CPU
+    interface register's `id` and 64-bit value (in `addr`), enumerated via
     `kvm_arm_get_sys_reg_indices()` and read/written using in-kernel accessors
     (`kvm_arm_sys_reg_read()` / `kvm_arm_sys_reg_write()`).
 

@@ -81,6 +81,31 @@ redundant with `vcpu->caretaker.job` during `.preserve()` and
   `virt/kvm/caretaker.c`, `virt/kvm/caretaker_debug.c`, `arch/x86/kvm/`, and
   `arch/arm64/kvm/`.
 
+## 6. Separate Variable-Length Arrays in `struct kvm_vcpu_arch_ser`
+
+Currently, x86 `struct kvm_vcpu_arch_ser` (`include/linux/kho/abi/kvm_x86.h`)
+packs `msrs[num_msrs]` and `cpuid_nent` `struct kvm_cpuid_entry2` entries
+back-to-back at the end of `struct kvm_vcpu_arch_ser` via untyped pointer
+arithmetic (`(void *)&state->msrs[state->num_msrs]`), and ARM64
+`struct kvm_vcpu_arch_ser` (`include/linux/kho/abi/kvm_arm64.h`) embeds
+`u32 num_sysregs` + `struct kvm_one_reg sysregs[]` inline:
+
+- On **x86** (`include/linux/kho/abi/kvm_x86.h`), replace `num_msrs`,
+  `cpuid_nent`, and `msrs[]` in `struct kvm_vcpu_arch_ser` with typed KHO
+  pointers to the existing uAPI variable-length container structures
+  `DECLARE_KHOSER_PTR(msrs, struct kvm_msrs *)` and
+  `DECLARE_KHOSER_PTR(cpuid, struct kvm_cpuid2 *)`.
+- On **ARM64** (`include/linux/kho/abi/kvm_arm64.h`), define
+  `struct kvm_arm64_sysregs_ser` (`u32 num_sysregs; u32 reserved;
+  struct kvm_one_reg sysregs[];`) and reference it from
+  `struct kvm_vcpu_arch_ser` via
+  `DECLARE_KHOSER_PTR(sysregs, struct kvm_arm64_sysregs_ser *)`.
+- Because `kho_alloc_preserve()` preserves memory at page granularity, compute
+  the full combined size up front and place `struct kvm_vcpu_arch_ser` together
+  with `struct kvm_msrs` and `struct kvm_cpuid2` (on x86) or
+  `struct kvm_arm64_sysregs_ser` (on ARM64) within a single contiguous
+  `kho_alloc_preserve(size)` allocation so there is zero extra page overhead.
+
 ---
 
 ## Already Implemented Since RFCv1
