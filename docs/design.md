@@ -110,8 +110,8 @@ preservation are developed as companion efforts:
   (`[PATCH v4 00/11] liveupdate: kvm: Guest_memfd preservation`) introduces
   `guest_memfd` support as well as the base KVM `vmfd` LUO preservation
   infrastructure (`virt/kvm/kvm_luo.c`) that this design expands upon for
-  secondary MMU and `vcpufd` preservation. Although RFCv1 was based on top of
-  that series for proof-of-concept purposes, OrphanVM does not depend on
+  secondary page table and `vcpufd` preservation. Although RFCv1 was based on
+  top of that series for proof-of-concept purposes, OrphanVM does not depend on
   `guest_memfd` and can also use standard preserved `memfd` or HugeTLB backing
   memory.
 - **Pass-Through Device and DMA Preservation**:
@@ -156,17 +156,18 @@ The OrphanVM design consists of four layers, ordered from bottom to top:
 | Layer 3 | `oncore`        | `CONFIG_LIVEUPDATE_ONCORE` | Workload-agnostic session (`oncore_session`) & job (`oncore_job`) |
 |         |                 |                            | Time-sliced round-robin FIFO runqueue                             |
 |         |                 |                            | Multiplexes $M$ jobs across $N$ preserved physical CPUs           |
-| Layer 2 | `cpu_preserve`  | `CONFIG_LIVEUPDATE_CPU`    | `.text.cpu_preserved` & `.data.cpu_preserved` outside KHO Scratch |
+| Layer 2 | `cpu_preserve`  | `CONFIG_LIVEUPDATE_CPU`    | `.text.cpu_preserved` & `.data.cpu_preserved`                     |
 |         |                 | `/sys/.../cpu<N>/preserve` | CPU hotplug interception & `!cpu_present(cpu)` SMP isolation      |
 |         |                 |                            | Isolated page tables (`cpu_preserved_as`) & stack context         |
-| Layer 1 | `kvm_luo`       | `KVM_CAP_VCPU_PRESERVE`    | `vmfd` & secondary MMU (TDP / Stage-2) KHO folio preservation     |
+| Layer 1 | `kvm_luo`       | `KVM_CAP_VCPU_PRESERVE`    | `vmfd` & secondary page table (TDP / Stage-2) LUO preservation    |
 |         |                 | `"kvm_vcpu_luo_v1"`        | `vcpufd` architectural state serialization (`kvm_vcpu_arch_ser`)  |
 
 This layering allows incremental upstreaming:
 
 - **Layer 1** is useful on its own without any physical CPU preservation: it
-  provides in-kernel `vcpufd` and secondary MMU preservation across `kexec`
-  (RAM-only suspend/resume without round-tripping vCPU state through userspace).
+  provides in-kernel `vcpufd` and secondary page table preservation across
+  `kexec` (RAM-only suspend/resume without round-tripping vCPU state through
+  userspace).
 - **Layer 2** preserves physical CPUs across `kexec` in an isolated address
   space, which in some cases speeds up incoming kernel boot by reducing the
   number of CPUs brought online during `smp_init()`, and includes a
@@ -193,7 +194,7 @@ KVM and LUO file descriptor preservation ioctls:
    While the VM is running, the VMM preserves its resources into a LUO session
    via `LIVEUPDATE_SESSION_PRESERVE_FD`:
    - Guest memory `memfd` or `guest_memfd` descriptors
-   - `vmfd`, preserving KVM metadata and secondary MMU page tables
+   - `vmfd`, preserving KVM metadata and secondary page tables
    - (Optional) Physical CPU descriptors
      (`/sys/devices/system/cpu/cpu<N>/preserve`), preserving them into the LUO
      session, which removes the target physical CPUs from the host scheduler and
@@ -240,7 +241,7 @@ KVM and LUO file descriptor preservation ioctls:
 
 ---
 
-## 3. Layer 1: In-RAM vCPU and Secondary MMU Preservation via LUO
+## 3. Layer 1: In-RAM vCPU and Secondary Page Table Preservation
 
 Before a vCPU can execute across `kexec` (or even be suspended and resumed in
 RAM without physical CPU preservation), both its architectural register state
@@ -333,27 +334,47 @@ present in the LUO session, this same `struct kvm_vcpu_arch_ser` buffer serves
 as the handoff area between the outgoing kernel, the Caretaker, and the incoming
 kernel.
 
-### 3.2 Secondary MMU (TDP / Stage-2) KHO Preservation
+### 3.2 Secondary Page Table Preservation
 
 During the `kexec` blackout window, the host KVM MMU fault handler is offline.
-For the guest to continue accessing its memory without triggering EPT
-Violations, NPT faults, or Stage-2 translation faults, the existing secondary
-page tables must remain intact in physical memory across `kexec`:
+For the guest to continue accessing its memory without triggering faults
+(Intel EPT Violations, AMD NPT faults, or ARM64 Stage-2 translation faults),
+the existing secondary page tables must remain intact in physical memory across
+`kexec`.
 
-- **x86 TDP MMU (`arch/x86/kvm/mmu/kho.c`)**:
-  `kvm_mmu_preserve_kho()` walks all valid TDP MMU roots
-  (`kvm_tdp_mmu_collect()`) and active MMU pages (`kvm_mmu_collect_all()`).
-  Because `kho_preserve_folio()` may allocate memory and sleep, preservation is
-  performed in two phases: first counting and collecting `struct page *`
-  pointers into `struct kvm_mmu_kho_pages` while holding `mmu_lock`, and then
-  allocating `struct kvm_kho_folios_ser` (`kvm_kho_folios_alloc()`) and invoking
-  `kho_preserve_folio()` outside `mmu_lock`.
-- **ARM64 Stage-2 MMU (`arch/arm64/kvm/kvm_luo.c`)**:
-  `kvm_arch_vm_luo_preserve()` preserves the Stage-2 root folio
-  (`mmu->pgd_phys`) and walks the guest's `struct kvm_s2_mmu` page table
-  (`mmu->pgt`) using `kvm_pgtable_walk()` with a `KVM_PGTABLE_WALK_TABLE_PRE`
-  visitor (`stage2_kho_visitor()`), recording every non-leaf Stage-2 page-table
-  folio in `struct kvm_kho_folios_ser`.
+Because secondary page tables are a VM-wide resource shared across all vCPUs,
+they are preserved once when `vmfd` is preserved. `kvm_luo_preserve()`
+serializes the VM type and a KHO pointer to the preserved folio list
+(`struct kvm_kho_folios_ser`) into `struct kvm_luo_ser`:
+
+```c
+struct kvm_kho_folios_ser {
+        u64 nr_folios;
+        u64 folios_pa[];
+} __packed;
+
+struct kvm_luo_ser {
+        u64 type;
+        DECLARE_KHOSER_PTR(kho_folios, struct kvm_kho_folios_ser *);
+} __packed;
+```
+
+Each architecture walks its secondary page tables during `vmfd` preservation to
+populate `folios_pa[]`:
+
+- **x86 (`arch/x86/kvm/mmu/kho.c`)**:
+  `kvm_mmu_preserve_kho()` collects all TDP root and non-leaf page-table pages
+  (`kvm->arch.tdp_mmu_roots`), active MMU pages (`kvm->arch.active_mmu_pages`),
+  and per-vCPU root page tables. Because `kho_preserve_folio()` may allocate
+  memory and sleep, preservation runs in two phases: first collecting the
+  `struct page *` pointers while holding `kvm->mmu_lock` for write, and then
+  allocating `struct kvm_kho_folios_ser` and invoking `kho_preserve_folio()`
+  outside `mmu_lock`.
+- **ARM64 (`arch/arm64/kvm/kvm_luo.c`)**:
+  `kvm_arch_vm_luo_preserve()` preserves the Stage-2 PGD root folio
+  (`mmu->pgd_phys`) and walks the guest's Stage-2 page table (`mmu->pgt`) via
+  `kvm_pgtable_walk()` (`KVM_PGTABLE_WALK_TABLE_PRE`), preserving every valid
+  non-leaf table folio in `struct kvm_kho_folios_ser`.
 
 ### 3.3 LUO Lifecycle: Freeze, Cancellation, Retrieve, and Finish
 
@@ -380,9 +401,8 @@ Across a live update, the LUO file handlers for guest memory (`memfd_luo.c`,
      `kho_preserve_folio()`.
    - **KVM (`vmfd` and `vcpufd`)**: Neither `kvm_luo_file_ops` nor
      `kvm_vcpu_luo_file_ops` defines a `.freeze()` callback because the
-     secondary MMU page tables and vCPU architectural/Caretaker state are
-     already preserved in KHO memory when `LIVEUPDATE_SESSION_PRESERVE_FD`
-     completes.
+     secondary page tables and vCPU architectural/Caretaker state are already
+     preserved in KHO memory when `LIVEUPDATE_SESSION_PRESERVE_FD` completes.
 2. **Cancellation (`.unpreserve()`) Before `kexec`**:
    If the LUO session file descriptor is closed before `kexec`
    (`luo_session_release()` -> `luo_file_unpreserve_files()`), LUO invokes
@@ -392,12 +412,12 @@ Across a live update, the LUO file handlers for guest memory (`memfd_luo.c`,
      `struct kvm_vcpu_arch_ser` back into the outgoing kernel's existing
      `struct kvm_vcpu`, and frees `ser->arch_state` and `struct kvm_vcpu_ser`
      (`kho_unpreserve_free()`). Because non-architectural host state (such as
-     memslots, secondary MMU page tables, and device bindings) remained in place
-     in the outgoing kernel, the VMM can immediately resume `KVM_RUN`.
-   - **`vmfd` (`kvm_luo_unpreserve()`)**: Unpreserves the secondary MMU
-     page-table folios in KHO (`kvm_kho_folios_unpreserve()` ->
-     `kho_unpreserve_folio()`, leaving the live page tables intact in the
-     outgoing `struct kvm`) and frees `struct kvm_luo_ser`.
+     memslots, secondary page tables, and device bindings) remained in place in
+     the outgoing kernel, the VMM can immediately resume `KVM_RUN`.
+   - **`vmfd` (`kvm_luo_unpreserve()`)**: Unpreserves the secondary page table
+     folios in KHO (`kvm_kho_folios_unpreserve()` -> `kho_unpreserve_folio()`,
+     leaving the live page tables intact in the outgoing `struct kvm`) and frees
+     `struct kvm_luo_ser`.
    - **`memfd` / `guest_memfd` (`memfd_luo_unpreserve()` /
      `kvm_gmem_luo_unpreserve()`)**: Unfreezes the inode
      (`shmem_freeze(inode, false)` or clearing `KVM_GMEM_FLAG_PRESERVED`),
@@ -426,10 +446,10 @@ Across a live update, the LUO file handlers for guest memory (`memfd_luo.c`,
        original page indices, and frees the KHO folio-list metadata.
      - **`vmfd` (`kvm_luo_retrieve()`)**: Detaches preserved physical CPU
        workloads (`kvm_caretaker_vm_pre_retrieve()`), allocates the new
-       `struct kvm` (`kvm_create_vm_file()`), and restores VM-wide architectural
-       state (`kvm_arch_vm_luo_retrieve()`, such as TSC offset and kHz on x86),
-       while keeping the outgoing kernel's KHO-preserved secondary MMU
-       page-table folios (`ser->kho_folios`) alive until `.finish()`.
+       `struct kvm` with the preserved `ser->type` (`kvm_create_vm_file()`), and
+       invokes `kvm_arch_vm_luo_retrieve()`, while keeping the outgoing kernel's
+       KHO-preserved secondary page table folios (`ser->kho_folios`) alive until
+       `.finish()`.
      - **`vcpufd` (`kvm_vcpu_luo_retrieve()`)**: Allocates the new
        `struct kvm_vcpu` (`kvm_create_vcpu_file()`), stops Caretaker execution
        (`kvm_caretaker_vcpu_pre_retrieve()`), and restores the updated
@@ -447,9 +467,9 @@ Across a live update, the LUO file handlers for guest memory (`memfd_luo.c`,
      telemetry, and `struct kvm_vcpu_ser`) via `kho_restore_free()`.
    - **`vmfd` (`kvm_luo_finish()`)**: Calls `kvm_kho_folios_finish()`
      (`kho_restore_folio()` + `folio_put()`) to restore and free the outgoing
-     kernel's KHO-preserved secondary MMU (TDP / Stage-2) page-table folios (as
-     the incoming `struct kvm` builds new secondary page tables against its
-     memslots) and frees `struct kvm_luo_ser`.
+     kernel's KHO-preserved secondary page table folios (as the incoming
+     `struct kvm` builds new secondary page tables against its memslots) and
+     frees `struct kvm_luo_ser`.
    - **`memfd` / `guest_memfd` (`memfd_luo_finish()` /
      `kvm_gmem_luo_finish()`)**: No-op if the file was retrieved (since
      `.retrieve()` already moved the folios into the new file's page cache); if
@@ -526,7 +546,16 @@ Each non-boot physical CPU exposes a sysfs control file:
 
 To preserve a CPU for a live update, userspace opens this file and preserves
 the file descriptor into a LUO session via `LIVEUPDATE_SESSION_PRESERVE_FD`
-(`"cpu_fh_v1"`, `struct cpu_preserved_file_ser`).
+(`"cpu_fh_v1"`, `include/linux/kho/abi/cpu.h`):
+
+```c
+struct cpu_preserved_file_ser {
+        u32 cpu;
+        u32 reserved;
+        u64 stack_pa;
+        DECLARE_KHOSER_PTR(oncore, struct oncore_session_ser *);
+} __packed;
+```
 
 ```
 Outgoing Kernel                      kexec                     Incoming Kernel
@@ -575,10 +604,26 @@ LIVEUPDATE_SESSION_PRESERVE_FD
      ensures that `reboot` / `kexec` shutdown paths (`smp_send_stop()`,
      `native_stop_other_cpus()`) skip sending `REBOOT_VECTOR` or `STOP` IPIs to
      the preserved core.
-   - Across `kexec`, a minimal LUO FLB global structure (`"cpu_flb_v1"`,
-     `struct cpu_preserved_global_ser`) carries the bitmap of preserved CPUs
-     (`cpu_preserved_bitmap`). During early boot in the **incoming kernel**,
-     `cpu_preserved_flb_retrieve()` reads this bitmap and calls
+   - Across `kexec`, a LUO FLB global structure (`"cpu_flb_v1"`,
+     `include/linux/kho/abi/cpu.h`) carries the preserved runtime buffer
+     addresses and the bitmap of preserved CPUs (`cpu_preserved_bitmap`):
+
+     ```c
+     struct cpu_preserved_global_ser {
+             u32 nr_cpu_words;
+             u32 reserved;
+             u64 text_runtime_pa;
+             u64 text_runtime_size;
+             u64 data_runtime_pa;
+             u64 data_runtime_size;
+             DECLARE_KHOSER_PTR(pcpus_runtime, struct cpu_preserved_pcpu_ser *);
+             DECLARE_KHOSER_PTR(transition_as, struct cpu_preserved_as_ser *);
+             u64 cpu_preserved_bitmap[];
+     } __packed;
+     ```
+
+     During early boot in the **incoming kernel**,
+     `cpu_preserved_flb_retrieve()` reads `cpu_preserved_bitmap` and calls
      `set_cpu_present(cpu, false)` *before* `smp_init()` runs. Because
      `smp_init()` only brings up CPUs in `cpu_present_mask`, the incoming kernel
      skips sending `INIT`/`SIPI` (x86) or `CPU_ON` PSCI calls (ARM64) to
@@ -636,14 +681,32 @@ tables are constructed using `kernel_ident_mapping_init()` (extended with
 x86 and `trans_pgd_map_range()` on ARM64. All page-table pages allocated for the
 isolated address space are recorded in `struct cpu_preserved_as_ser` so the
 incoming kernel can adopt (`cpu_preserved_as_adopt()`) and free them
-(`cpu_preserved_as_destroy()`) after the CPU returns to normal operation.
+(`cpu_preserved_as_destroy()`) after the CPU returns to normal operation:
+
+```c
+struct cpu_preserved_as_ser {
+        u32 nr_pgtable_pages;
+        u32 reserved;
+        u64 pgtable_pages[CPU_PRESERVED_AS_MAX_PGTABLE_PAGES];
+} __packed;
+```
 
 To avoid relying on host per-CPU offset registers (`%gs` on x86 or
 `TPIDR_EL1`/`TPIDR_EL2` on ARM64), which may be clobbered by guest execution or
-differ across kernels, per-CPU metadata (`struct cpu_preserved_stack_context`)
-is placed at the base of the power-of-two aligned preserved stack (4KB on x86,
-16KB on ARM64) and located in $O(1)$ time by masking the stack pointer:
-`sp & ~(CPU_PRESERVED_STACK_SIZE - 1)`.
+differ across kernels, per-CPU metadata (`struct cpu_preserved_stack_context`,
+`include/linux/cpu_preserve.h`) is placed at the base of the power-of-two
+aligned preserved stack (4KB on x86, 16KB on ARM64) and located in $O(1)$ time
+by masking the stack pointer (`sp & ~(CPU_PRESERVED_STACK_SIZE - 1)`):
+
+```c
+struct cpu_preserved_stack_context {
+        u64 magic;
+        u32 cpu;
+        u32 reserved;
+        u64 workload_context;
+        u64 session_pgd_pa;
+};
+```
 
 ---
 
@@ -746,9 +809,20 @@ on outgoing-kernel internal structures**. Only structures defined in
 
 - **Cross-Kernel KHO ABI (`include/linux/kho/abi/kvm.h`, `kvm_x86.h`,
   `kvm_arm64.h`)**:
-  - `struct kvm_caretaker_cb_ser`: Contains the `state`
-    (`enum kvm_caretaker_state`), the physical CPU ID (`pcpu_id`), `vcpu_id`,
-    and a KHO pointer (`telemetry`) to `struct kvm_caretaker_telemetry_ser`.
+  - `struct kvm_caretaker_cb_ser` coordinates the execution state (`state`,
+    `enum kvm_caretaker_state`), the physical CPU ID (`pcpu_id`), `vcpu_id`,
+    and the KHO pointer (`telemetry`) to `struct kvm_caretaker_telemetry_ser`:
+
+    ```c
+    struct kvm_caretaker_cb_ser {
+            u32 state;
+            u32 pcpu_id;
+            u32 vcpu_id;
+            u32 reserved;
+            DECLARE_KHOSER_PTR(telemetry, struct kvm_caretaker_telemetry_ser *);
+    } __packed;
+    ```
+
   - `struct kvm_caretaker_arch_ser`: Contains `struct kvm_caretaker_cb_ser cb`
     at offset 0, plus only the minimal architecture fields required by the
     incoming kernel during hardware state adoption (such as `apic_id`,
@@ -849,7 +923,7 @@ machine to hand the vCPU back to host KVM:
   `kvm_arch_vcpu_luo_attach_caretaker()`), cancels the `oncore_job`
   (`oncore_session_cancel_job()`), and unpreserves and frees the Caretaker
   runtime, hardware, and telemetry pages (`kho_unpreserve_free()`). Because
-  non-architectural host state (memslots, secondary MMU page tables, and device
+  non-architectural host state (memslots, secondary page tables, and device
   bindings) never left the outgoing kernel's `struct kvm_vcpu`, the VMM can
   immediately resume `KVM_RUN`.
 - **Reclamation in the Incoming Kernel (`kvm_caretaker_vm_pre_retrieve()`,
@@ -923,11 +997,20 @@ x86 with vendor `struct kvm_x86_caretaker_ops` (`init`, `sync_vcpu`, and
 
 Because standard host tracing (`ftrace`, `perf`, `bpf`) cannot run on isolated
 CPUs during `kexec`, `struct kvm_caretaker_telemetry_ser` in the KHO ABI
-(`CONFIG_KVM_CARETAKER_DEBUG`) records per-vCPU activity during the gap:
+(`include/linux/kho/abi/kvm.h`, `CONFIG_KVM_CARETAKER_DEBUG`) records per-vCPU
+activity during the gap:
 
-- Execution and exit counts (`total_runs`, `total_exits`, `stall_count`)
-- Most recent exit diagnostics (`last_exit_reason`, `last_exit_rip`)
-- Stall diagnostics (`stall_exit_reason`, `stall_exit_rip`)
+```c
+struct kvm_caretaker_telemetry_ser {
+        u64 total_runs;
+        u64 total_exits;
+        u64 stall_count;
+        u64 last_exit_reason;
+        u64 last_exit_rip;
+        u64 stall_exit_reason;
+        u64 stall_exit_rip;
+} __packed;
+```
 
 When the incoming kernel adopts the vCPU, it copies this telemetry from the KHO
 ABI struct (`kvm_caretaker_telemetry_report()`) and exposes it under
