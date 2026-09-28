@@ -167,48 +167,76 @@ This layering allows incremental upstreaming:
 - **Layer 1** is useful on its own without any physical CPU preservation: it
   provides in-kernel `vcpufd` and secondary MMU preservation across `kexec`
   (RAM-only suspend/resume without round-tripping vCPU state through userspace).
-- **Layers 2 and 3** provide generic infrastructure for keeping physical CPUs
-  alive in an isolated address space across `kexec` and scheduling bounded work
-  on them.
+- **Layer 2** preserves physical CPUs across `kexec` in an isolated address
+  space, which in some cases speeds up incoming kernel boot by reducing the
+  number of CPUs brought online during `smp_init()`, and includes a
+  `liveupdate/` selftest (`luo_cpu_preserve`) that verifies the correctness of
+  this layer in isolation.
+- **Layer 3** provides the generic scheduler for running bounded work on
+  preserved physical CPUs, and can also include a selftest with a sample
+  in-kernel `oncore_job` to verify its scheduling capabilities independently of
+  KVM.
 - **Layer 4** connects preserved KVM vCPUs to the `oncore` scheduler when both
   `vcpufd`s and physical CPUs are preserved within the same LUO session.
 
 ### 2.1 End-to-End VMM Orchestration Flow
 
 The kernel interfaces are VMM-agnostic and operate through standard
-KVM and LUO file-descriptor preservation ioctls:
+KVM and LUO file descriptor preservation ioctls:
 
 1. **Creation & Capability Discovery**:
    The userspace VMM queries `KVM_CAP_VCPU_PRESERVE` and `KVM_CAP_CARETAKER` via
-   `KVM_CHECK_EXTENSION`, and creates `vmfd`, guest backing `memfd`, and
-   `vcpufd`s. Normal `KVM_RUN` execution proceeds without any Caretaker
-   interposition.
-2. **LUO Session Registration & Isolation**:
-   Prior to a live update, the VMM pauses userspace-emulated devices, stops its
-   `KVM_RUN` threads, and registers its resources into a LUO session via
-   `LIVEUPDATE_SESSION_PRESERVE_FD`:
-   - Guest memory `memfd` descriptors
-   - `vmfd`, preserving KVM metadata and secondary MMU page tables in KHO memory
-   - Physical CPU descriptors (`/sys/devices/system/cpu/cpu<N>/preserve`),
-     offlining the target physical cores via CPU hotplug into the isolated
-     `oncore_session` execution loop
-   - Each `vcpufd`, serializing architectural state into KHO memory and queuing
-     the vCPU onto the `oncore_session` runqueue so it immediately resumes guest
-     execution on the preserved physical CPUs
-3. **The Kexec Gap**:
-   The VMM process exits and the host executes `kexec -e`. Management CPUs
-   reboot into the incoming kernel while the preserved physical CPUs
-   (`!cpu_present`) continue executing guest vCPUs inside the Caretaker's
-   isolated address space.
-4. **Reclamation**:
+   `KVM_CHECK_EXTENSION`, and creates `vmfd`, guest backing `memfd` or
+   `guest_memfd`, and `vcpufd`s. Normal `KVM_RUN` execution proceeds without any
+   Caretaker interposition.
+2. **LUO Session Preservation & Handoff to Caretaker**:
+   While the VM is running, the VMM preserves its resources into a LUO session
+   via `LIVEUPDATE_SESSION_PRESERVE_FD`:
+   - Guest memory `memfd` or `guest_memfd` descriptors
+   - `vmfd`, preserving KVM metadata and secondary MMU page tables
+   - (Optional) Physical CPU descriptors
+     (`/sys/devices/system/cpu/cpu<N>/preserve`), preserving them into the LUO
+     session, which removes the target physical CPUs from the host scheduler and
+     parks them in `cpu_preserved_park_loop()` (in `.text.cpu_preserved` on a
+     dedicated preserved stack and isolated page tables) until a workload is
+     attached
+   - Each `vcpufd`: the VMM pauses the vCPU's `KVM_RUN` thread and preserves
+     `vcpufd`, which serializes the ABI-defined architectural state
+     (`struct kvm_vcpu_ser` and `struct kvm_vcpu_arch_ser`), initializes its
+     Caretaker control block (`struct kvm_caretaker_cb_ser`), and activates the
+     `oncore_job` (`oncore_session_activate_job()`), resulting in one of three
+     scenarios:
+     - **Idle preserved pCPU available**: If a preserved physical CPU in the
+       session has nothing scheduled on it (parked in
+       `cpu_preserved_park_loop()`), `oncore_session` attaches to that pCPU and
+       immediately kicks it to resume guest execution in the Caretaker.
+     - **Preserved pCPUs already running vCPU jobs**: If the session's preserved
+       physical CPUs are already executing other vCPU jobs, the new `oncore_job`
+       is queued on the `oncore_runqueue` and time-sliced across the preserved
+       pCPUs alongside the existing jobs.
+     - **No preserved pCPUs available**: If no physical CPUs have been preserved
+       into the LUO session, the vCPU remains suspended until physical CPUs are
+       added (or until retrieved in the incoming kernel).
+3. **(Optional) Cancellation**:
+   If the live update is canceled (i.e., the LUO session file descriptor is
+   closed before `kexec`), LUO unpreserves all resources in the session: each
+   vCPU detaches from the Caretaker, restores its updated architectural state
+   into the outgoing `struct kvm_vcpu`, and any preserved physical CPUs return
+   to the host scheduler so the VMM can resume `KVM_RUN`.
+4. **The Kexec Gap**:
+   The host performs a `kexec` reboot. Management CPUs reboot into the incoming
+   kernel while the preserved physical CPUs (`!cpu_present`) continue executing
+   guest vCPUs inside the Caretaker's isolated address space.
+5. **Reclamation**:
    Once the incoming kernel boots, the new VMM instance opens the preserved LUO
-   session and issues `LIVEUPDATE_SESSION_RETRIEVE_FD` for the `memfd`, `vmfd`,
-   and `vcpufd` tokens. Retrieving each `vcpufd` atomically detaches the vCPU
-   from the Caretaker (`KVM_CARETAKER_STOPPED`) and synchronizes its updated
-   architectural state into the new kernel's `struct kvm_vcpu`. Issuing
-   `LIVEUPDATE_SESSION_FINISH` releases the preserved physical CPUs back to the
-   host Linux scheduler via `add_cpu()`, and the VMM resumes normal `KVM_RUN`
-   threads.
+   session and issues `LIVEUPDATE_SESSION_RETRIEVE_FD` for the
+   `memfd`/`guest_memfd`, `vmfd`, and `vcpufd` tokens (preserved physical CPU
+   tokens do not need to be retrieved). Retrieving each `vcpufd` detaches the
+   vCPU from the Caretaker and restores its updated architectural state into the
+   new kernel's `struct kvm_vcpu`. Issuing `LIVEUPDATE_SESSION_FINISH` (or
+   closing the session file descriptor) frees the KHO handover structures,
+   returns the preserved physical CPUs to the host scheduler, and allows the VMM
+   to resume normal `KVM_RUN` threads.
 
 ---
 
@@ -227,7 +255,7 @@ In a traditional live update, the userspace VMM must extract all vCPU state via
 dozens of `KVM_GET_*` ioctls prior to `kexec`, serialize that state into a file
 or memory buffer, and re-issue `KVM_SET_*` ioctls after `kexec`.
 
-In RFCv1, `vcpufd` is registered directly with LUO via
+In RFCv1, `vcpufd` is preserved directly into a LUO session via
 `LIVEUPDATE_SESSION_PRESERVE_FD` (`"kvm_vcpu_luo_v1"`), governed by the
 `KVM_CAP_VCPU_PRESERVE` capability:
 
@@ -286,6 +314,108 @@ page tables must remain intact in physical memory across `kexec`:
   (`mmu->pgt`) using `kvm_pgtable_walk()` with a `KVM_PGTABLE_WALK_TABLE_PRE`
   visitor (`stage2_kho_visitor()`), recording every non-leaf Stage-2 page-table
   folio in `struct kvm_kho_folios_ser`.
+
+### 3.3 LUO Lifecycle: Freeze, Cancellation, Retrieve, and Finish
+
+Across a live update, the LUO file handlers for guest memory (`memfd_luo.c`,
+`guest_memfd_luo.c`), the VM (`kvm_luo_file_ops`), and vCPUs
+(`kvm_vcpu_luo_file_ops`) coordinate four lifecycle transitions:
+
+1. **Pre-`kexec` `.freeze()` Phase (`luo_freeze()`)**:
+   When `reboot(LINUX_REBOOT_CMD_KEXEC)` executes, `liveupdate_reboot()` invokes
+   `luo_freeze()` before jumping to the incoming kernel:
+   - **Guest Memory (`memfd` and `guest_memfd`)**: During
+     `LIVEUPDATE_SESSION_PRESERVE_FD`, `memfd_luo_preserve()` freezes the shmem
+     inode (`shmem_freeze(inode, true)`) and pins `VM_SHARED` VMA mappings
+     (`mm_liveupdate_pin_vmas()`), while `kvm_gmem_luo_preserve()` sets
+     `KVM_GMEM_FLAG_PRESERVED` (blocking `fallocate` and punch-hole operations)
+     so already-allocated guest RAM can continue to be accessed and dirtied up
+     until `kexec`. At `kexec` time, `memfd_luo_freeze()`
+     (`memfd_luo_save_folios()`) walks the inode's page cache
+     (`filemap_get_folios_contig()`), cleans dirty folios (`folio_mkclean()`),
+     calls `kho_preserve_folio()` on each allocated folio, and records their
+     PFNs in `struct memfd_luo_folio_ser`. Similarly, `kvm_gmem_luo_freeze()`
+     walks the `guest_memfd` page cache, records each folio's PFN and
+     preparation state (`KVM_GMEM_SER_PREPARED`), and preserves each folio via
+     `kho_preserve_folio()`.
+   - **KVM (`vmfd` and `vcpufd`)**: Neither `kvm_luo_file_ops` nor
+     `kvm_vcpu_luo_file_ops` defines a `.freeze()` callback because the
+     secondary MMU page tables and vCPU architectural/Caretaker state are
+     already preserved in KHO memory when `LIVEUPDATE_SESSION_PRESERVE_FD`
+     completes.
+2. **Cancellation (`.unpreserve()`) Before `kexec`**:
+   If the LUO session file descriptor is closed before `kexec`
+   (`luo_session_release()` -> `luo_file_unpreserve_files()`), LUO invokes
+   `.unpreserve()` in reverse preservation order:
+   - **`vcpufd` (`kvm_vcpu_luo_unpreserve()`)**: Detaches the vCPU from the
+     Caretaker (if active), restores its updated architectural state from
+     `struct kvm_vcpu_arch_ser` back into the outgoing kernel's existing
+     `struct kvm_vcpu`, and frees `ser->arch_state` and `struct kvm_vcpu_ser`
+     (`kho_unpreserve_free()`). Because non-architectural host state (such as
+     memslots, secondary MMU page tables, and device bindings) remained in place
+     in the outgoing kernel, the VMM can immediately resume `KVM_RUN`.
+   - **`vmfd` (`kvm_luo_unpreserve()`)**: Unpreserves the secondary MMU
+     page-table folios in KHO (`kvm_kho_folios_unpreserve()` ->
+     `kho_unpreserve_folio()`, leaving the live page tables intact in the
+     outgoing `struct kvm`) and frees `struct kvm_luo_ser`.
+   - **`memfd` / `guest_memfd` (`memfd_luo_unpreserve()` /
+     `kvm_gmem_luo_unpreserve()`)**: Unfreezes the inode
+     (`shmem_freeze(inode, false)` or clearing `KVM_GMEM_FLAG_PRESERVED`),
+     unpins VMAs, and frees the KHO serialization metadata.
+3. **Incoming `.retrieve()` (`LIVEUPDATE_SESSION_RETRIEVE_FD`) and Retrieval
+   Order**:
+   In the incoming kernel, `luo_retrieve_file()` (used by both
+   `LIVEUPDATE_SESSION_RETRIEVE_FD` and `liveupdate_get_file_incoming()`)
+   resolves inter-file dependencies lazily:
+   - Both `kvm_gmem_luo_retrieve()` and `kvm_vcpu_luo_retrieve()` look up their
+     parent VM via `liveupdate_get_file_incoming(args->session, ser->vm_token,
+     &vm_file)`. If `vmfd` has not been retrieved yet (`retrieve_status == 0`),
+     LUO automatically invokes `kvm_luo_retrieve()` on `vm_token` first and
+     caches `luo_file->file`; when userspace later calls
+     `LIVEUPDATE_SESSION_RETRIEVE_FD` on `vm_token`, LUO installs a file
+     descriptor for that already-created `struct kvm`.
+   - In practice, the VMM retrieves `memfd`/`guest_memfd` and `vmfd` first,
+     re-establishes non-preserved VM state on `vmfd` (such as `mmap()`ing
+     `memfd`, registering memslots via `KVM_SET_USER_MEMORY_REGION2`, and
+     re-creating in-kernel IRQchip and device bindings), and then retrieves each
+     `vcpufd`:
+     - **`memfd` / `guest_memfd` (`memfd_luo_retrieve()` /
+       `kvm_gmem_luo_retrieve()`)**: Allocates a new file, calls
+       `kho_restore_folio()` on each preserved guest RAM folio, re-inserts the
+       folios into the new file's `inode->i_mapping` page cache at their
+       original page indices, and frees the KHO folio-list metadata.
+     - **`vmfd` (`kvm_luo_retrieve()`)**: Detaches preserved physical CPU
+       workloads (`kvm_caretaker_vm_pre_retrieve()`), allocates the new
+       `struct kvm` (`kvm_create_vm_file()`), and restores VM-wide architectural
+       state (`kvm_arch_vm_luo_retrieve()`, such as TSC offset and kHz on x86),
+       while keeping the outgoing kernel's KHO-preserved secondary MMU
+       page-table folios (`ser->kho_folios`) alive until `.finish()`.
+     - **`vcpufd` (`kvm_vcpu_luo_retrieve()`)**: Allocates the new
+       `struct kvm_vcpu` (`kvm_create_vcpu_file()`), stops Caretaker execution
+       (`kvm_caretaker_vcpu_pre_retrieve()`), and restores the updated
+       architectural state from `ser->arch_state` (`struct kvm_vcpu_arch_ser`)
+       into the new `struct kvm_vcpu` (`kvm_arch_vcpu_luo_retrieve()` and
+       `kvm_caretaker_vcpu_retrieve()`).
+4. **Incoming `.finish()` (`LIVEUPDATE_SESSION_FINISH` or
+   `close(session_fd)`)**:
+   When userspace issues `LIVEUPDATE_SESSION_FINISH` (or closes the retrieved
+   session file descriptor), `luo_file_finish()` iterates over all session
+   entries in reverse order to release KHO handover memory:
+   - **`vcpufd` (`kvm_vcpu_luo_finish()`)**: Ensures the Caretaker vCPU has
+     stopped (in case `vcpufd` was never retrieved) and frees all KHO-preserved
+     vCPU allocations (`ser->arch_state`, `ser->cb`, per-vCPU hardware pages,
+     telemetry, and `struct kvm_vcpu_ser`) via `kho_restore_free()`.
+   - **`vmfd` (`kvm_luo_finish()`)**: Calls `kvm_kho_folios_finish()`
+     (`kho_restore_folio()` + `folio_put()`) to restore and free the outgoing
+     kernel's KHO-preserved secondary MMU (TDP / Stage-2) page-table folios (as
+     the incoming `struct kvm` builds new secondary page tables against its
+     memslots) and frees `struct kvm_luo_ser`.
+   - **`memfd` / `guest_memfd` (`memfd_luo_finish()` /
+     `kvm_gmem_luo_finish()`)**: No-op if the file was retrieved (since
+     `.retrieve()` already moved the folios into the new file's page cache); if
+     never retrieved, discards and frees the unretrieved KHO folios.
+   - **LUO Session Core**: Drops LUO's internal `struct file *` reference
+     (`fput()`) on each retrieved file and destroys the session's KHO block set.
 
 ---
 
@@ -354,8 +484,8 @@ kernel virtual addresses, while backed by safe physical pages that survive
 Each non-boot physical CPU exposes a sysfs control file:
 `/sys/devices/system/cpu/cpu<N>/preserve`.
 
-To preserve a CPU for a live update, userspace opens this file and registers the
-file descriptor with a LUO session via `LIVEUPDATE_SESSION_PRESERVE_FD`
+To preserve a CPU for a live update, userspace opens this file and preserves
+the file descriptor into a LUO session via `LIVEUPDATE_SESSION_PRESERVE_FD`
 (`"cpu_fh_v1"`, `struct cpu_preserved_file_ser`).
 
 ```
@@ -392,10 +522,15 @@ LIVEUPDATE_SESSION_PRESERVE_FD
    `cpu_preserved_report_dead()`, which diverts preserved cores into
    `cpu_preserved_park()` instead of `arch_cpu_idle_dead()` (which would place
    the core in an ACPI/PSCI sleep state).
-2. **Isolating via `!cpu_present(cpu)`**:
+2. **Isolating via `!cpu_present(cpu)` Across the Kexec Gap**:
    Once `remove_cpu(cpu)` completes and the target core is executing on its
    preserved stack and isolated page tables in `cpu_preserved_park_loop()`, the
    outgoing kernel calls `set_cpu_present(cpu, false)`.
+   - Because each preserved core is already offline, removed from
+     `cpu_present_mask`, and executing inside its isolated address space from
+     the moment `LIVEUPDATE_SESSION_PRESERVE_FD` completes, neither
+     `cpu_preserve_file_ops` nor `cpu_preserved_flb_ops` requires a `.freeze()`
+     callback at `kexec` time.
    - In the **outgoing kernel**, marking the CPU neither online nor present
      ensures that `reboot` / `kexec` shutdown paths (`smp_send_stop()`,
      `native_stop_other_cpus()`) skip sending `REBOOT_VECTOR` or `STOP` IPIs to
@@ -409,13 +544,36 @@ LIVEUPDATE_SESSION_PRESERVE_FD
      skips sending `INIT`/`SIPI` (x86) or `CPU_ON` PSCI calls (ARM64) to
      preserved cores without requiring architecture-specific changes in the SMP
      boot path.
-3. **Reclamation**:
-   When the live update completes (`LIVEUPDATE_SESSION_FINISH`) or is cancelled,
-   `cpu_unpreserve()` calls `cpu_signal_exit(cpu)` (setting `ser->workload` to
-   `CPU_PRESERVED_EXITING`), sends a wakeup IPI (`arch_cpu_preserved_kick()`),
-   waits in `cpu_wait_dead(cpu)` for the CPU to exit `cpu_preserved_park_loop()`
-   and publish `CPU_PRESERVED_DEAD`, restores `set_cpu_present(cpu, true)`, and
-   calls `add_cpu(cpu)` to bring the core back into the host scheduler.
+3. **Cancellation and Incoming Kernel Reclamation**:
+   - **Cancellation (`cpu_preserve_unpreserve()` +
+     `cpu_preserved_flb_unpreserve()`)**: If the LUO session file descriptor is
+     closed before `kexec`, `cpu_preserve_unpreserve()` calls
+     `cpu_unpreserve(cpu)` (which sets `ser->workload` to
+     `CPU_PRESERVED_EXITING` via `cpu_signal_exit(cpu)`, sends a wakeup IPI via
+     `arch_cpu_preserved_kick()`, waits in `cpu_wait_dead(cpu)` for the core to
+     exit `cpu_preserved_park_loop()` and publish `CPU_PRESERVED_DEAD`, frees
+     its preserved stack, restores `set_cpu_present(cpu, true)`, and calls
+     `add_cpu(cpu)` to return the core to the host scheduler) and removes the
+     CPU from `oncore_session` (`oncore_session_remove_cpu()`). Once the last
+     preserved CPU is unpreserved, `cpu_preserved_flb_unpreserve()` unpreserves
+     the `.text.cpu_preserved` / `.data.cpu_preserved` runtime buffer pages and
+     `cpu_preserved_transition_as` page tables.
+   - **Incoming Kernel Reclamation (`cpu_preserve_finish()` +
+     `cpu_preserved_flb_finish()`)**: Userspace does not need to call
+     `LIVEUPDATE_SESSION_RETRIEVE_FD` for preserved physical CPU tokens
+     (`"cpu_fh_v1"`). When `LIVEUPDATE_SESSION_FINISH` is issued (or the
+     session file descriptor is closed), `cpu_preserve_finish()` automatically
+     reconstructs the incoming CPU state (`cpu_preserve_restore_incoming_cpu()`)
+     if `.retrieve()` was not called, invokes `cpu_unpreserve(cpu)`
+     (`CPU_PRESERVED_EXITING` -> `CPU_PRESERVED_DEAD` ->
+     `set_cpu_present(cpu, true)` -> `add_cpu(cpu)`), removes the CPU from
+     `oncore_session` (`oncore_session_remove_cpu()`, which destroys the
+     session and frees its isolated page tables `cpu_preserved_as` once the last
+     CPU is removed), and frees `struct cpu_preserved_file_ser`. Once the last
+     preserved CPU finishes, `cpu_preserved_flb_finish()` frees the outgoing
+     kernel's preserved `.text.cpu_preserved` / `.data.cpu_preserved` buffer
+     pages, `cpu_preserved_transition_as` page tables, and `pcpus_ser` array via
+     `kho_restore_free()`.
 
 ### 4.3 Isolated Address Space (`struct cpu_preserved_as`) and Stack Context
 
@@ -521,9 +679,24 @@ The KVM Caretaker engine (`virt/kvm/caretaker.c`,
 preservation (Layer 1) with the `oncore` scheduler (Layer 3).
 
 When `CONFIG_KVM_CARETAKER` (`KVM_CAP_CARETAKER`) is supported and a `vcpufd` is
-preserved into a LUO session that also contains preserved physical CPUs, KVM
-initializes a `struct kvm_caretaker_vcpu` and submits an `oncore_job` to the
-session.
+preserved into a LUO session that also contains preserved physical CPUs:
+
+1. `kvm_caretaker_vcpu_pre_preserve()` allocates a `struct oncore_job` for
+   `kvm_arch_vcpu_caretaker_run()` on the session's least-loaded preserved
+   physical CPU and sets `KVM_VCPU_LUO_FLAG_CARETAKER`.
+2. `kvm_arch_vcpu_luo_preserve()` serializes the vCPU's architectural state into
+   `struct kvm_vcpu_arch_ser`, initializes the architecture Caretaker runtime
+   page (`kvm_caretaker_init_common_vcpu()`, setting `cb->state` to
+   `KVM_CARETAKER_PAUSED`), and maps the runtime page and `arch_state` buffer
+   into the session's isolated `cpu_preserved_as`.
+3. `kvm_caretaker_vcpu_post_preserve()` binds `cb` to the job and calls
+   `oncore_session_activate_job()`, queuing the job on the `oncore_runqueue`:
+   if an idle preserved physical CPU is parked in `cpu_preserved_park_loop()`,
+   `oncore_session` attaches to it and kicks it so the vCPU immediately resumes
+   guest execution; if all preserved CPUs in the session are already running
+   vCPU jobs, the job is time-sliced across them; and if no physical CPUs are
+   available in the LUO session, the vCPU remains suspended until CPUs are
+   added.
 
 ### 6.1 Cross-Kexec ABI Invariant vs. Private Runtime Pages
 
@@ -557,9 +730,10 @@ on outgoing-kernel internal structures**. Only structures defined in
 ### 6.2 Cross-Kernel State Machine
 
 Handoff between the preserved physical CPU (running the outgoing kernel's
-`.text.cpu_preserved` code) and the incoming kernel (running `.retrieve()` in a
-normal task context) is coordinated via atomic `cmpxchg()` transitions on
-`cb->state`:
+`.text.cpu_preserved` code) and the host kernel reclaiming the vCPU (either the
+incoming kernel during `kvm_caretaker_vcpu_pre_retrieve()` or the outgoing
+kernel on cancellation during `kvm_caretaker_vcpu_unpreserve()`) is coordinated
+via atomic `cmpxchg()` transitions on `cb->state`:
 
 ```
                   oncore_job->run_fn() (quantum start)
@@ -574,7 +748,7 @@ normal task context) is coordinated via atomic `cmpxchg()` transitions on
        |                 +------------------------+                 |
        |                quantum end / yield / stall                 |
        |                                                            |
-       | Incoming kernel attach:            Incoming kernel attach: |
+       | Host kernel attach:                Host kernel attach:     |
        | cmpxchg(PAUSED -> STOPPED)         cmpxchg(RUNNING ->      |
        | (Immediate 0ns reclaim)                    STOPPING)       |
        |                                    + kick(cb->pcpu_id)     |
@@ -590,7 +764,7 @@ normal task context) is coordinated via atomic `cmpxchg()` transitions on
        v                                                            v
     +------------------------------------------------------------------+
     |                     KVM_CARETAKER_STOPPED (3)                    |
-    |          (ser->arch_state is complete; incoming KVM owns vCPU)   |
+    |          (ser->arch_state is complete; host KVM owns vCPU)       |
     +------------------------------------------------------------------+
 ```
 
@@ -606,20 +780,61 @@ boundaries**:
   `KVM_CARETAKER_PAUSED`.
 - Therefore, whenever `cb->state == KVM_CARETAKER_PAUSED`, `ser->arch_state` is
   guaranteed to hold the complete, up-to-date architectural state of the vCPU.
-- When the incoming kernel calls `kvm_caretaker_wait_for_attach()`:
+- When the reclaiming kernel calls `kvm_caretaker_wait_for_attach()`:
   - **Fast Path (`PAUSED -> STOPPED`)**: If `cb->state` is `PAUSED`, a single
     `cmpxchg(&cb->state, KVM_CARETAKER_PAUSED, KVM_CARETAKER_STOPPED)` claims
     the vCPU immediately without waiting for or kicking any physical CPU. When
     the `oncore` scheduler next invokes the job, it observes `STOPPED` and
     returns `ONCORE_EXIT_ATTACH_SIGNALED`.
   - **Active Path (`RUNNING -> STOPPING -> STOPPED`)**: If `cb->state` is
-    `RUNNING`, the incoming kernel executes
+    `RUNNING`, the reclaiming kernel executes
     `cmpxchg(&cb->state, KVM_CARETAKER_RUNNING, KVM_CARETAKER_STOPPING)` and
     sends a physical IPI (`arch_cpu_preserved_kick(pcpu)`). The IPI forces an
     immediate VM-exit on the preserved CPU; the Caretaker loop observes
     `STOPPING` (`kvm_caretaker_should_exit()`), runs `detach_serialize()`,
     publishes `KVM_CARETAKER_STOPPED`, and returns
     `ONCORE_EXIT_ATTACH_SIGNALED`.
+
+Both live-update cancellation and incoming-kernel reclamation use this state
+machine to hand the vCPU back to host KVM:
+
+- **Cancellation in the Outgoing Kernel (`kvm_caretaker_vcpu_unpreserve()`)**:
+  When the LUO session file descriptor is closed before `kexec`,
+  `kvm_caretaker_vcpu_unpreserve()` invokes
+  `kvm_arch_vcpu_luo_pre_retrieve_caretaker()`
+  (`kvm_caretaker_wait_for_attach()`) to transition `cb->state` to
+  `KVM_CARETAKER_STOPPED`, restores the updated architectural state
+  (`struct kvm_vcpu_arch_ser`) and hardware control state back into the outgoing
+  kernel's existing `struct kvm_vcpu` (`kvm_arch_vcpu_luo_retrieve()` and
+  `kvm_arch_vcpu_luo_attach_caretaker()`), cancels the `oncore_job`
+  (`oncore_session_cancel_job()`), and unpreserves and frees the Caretaker
+  runtime, hardware, and telemetry pages (`kho_unpreserve_free()`). Because
+  non-architectural host state (memslots, secondary MMU page tables, and device
+  bindings) never left the outgoing kernel's `struct kvm_vcpu`, the VMM can
+  immediately resume `KVM_RUN`.
+- **Reclamation in the Incoming Kernel (`kvm_caretaker_vm_pre_retrieve()`,
+  `kvm_caretaker_vcpu_pre_retrieve()`, `kvm_caretaker_vcpu_retrieve()`, and
+  `kvm_caretaker_vcpu_finish()`)**:
+  1. When `vmfd` is retrieved (`kvm_luo_retrieve()`),
+     `kvm_caretaker_vm_pre_retrieve()` calls `cpu_preserved_detach_workload()`
+     on preserved physical CPUs (`ser->workload = CPU_PRESERVED_PARKED` + IPI
+     kick), causing any running Caretaker vCPU to VM-exit, run
+     `detach_serialize()`, publish `KVM_CARETAKER_PAUSED`, and return the
+     physical CPU from `oncore_cpu_schedule_loop()` to
+     `cpu_preserved_park_loop()`.
+  2. When each `vcpufd` is retrieved (`kvm_vcpu_luo_retrieve()`),
+     `kvm_caretaker_vcpu_pre_retrieve()` calls `kvm_caretaker_wait_for_attach()`
+     to transition `cb->state` to `KVM_CARETAKER_STOPPED` (invalidating CPU data
+     caches over `ser->cb` and `ser->arch_state` on ARM64), restores the updated
+     architectural state from `ser->arch_state` (`struct kvm_vcpu_arch_ser`)
+     into the newly allocated `struct kvm_vcpu`
+     (`kvm_arch_vcpu_luo_retrieve()`), and synchronizes hardware control state
+     (`kvm_caretaker_vcpu_retrieve()`).
+  3. When `LIVEUPDATE_SESSION_FINISH` is issued (`kvm_vcpu_luo_finish()` ->
+     `kvm_caretaker_vcpu_finish()`), the kernel ensures `cb->state` has reached
+     `KVM_CARETAKER_STOPPED` (in case `vcpufd` was never retrieved), reports and
+     frees the KHO telemetry buffer, and frees the Caretaker runtime page and
+     per-vCPU preserved hardware pages (`kho_restore_free()`).
 
 ### 6.3 Architecture Backends in RFCv1
 
