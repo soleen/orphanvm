@@ -260,30 +260,70 @@ In RFCv1, `vcpufd` is preserved directly into a LUO session via
 `KVM_CAP_VCPU_PRESERVE` capability:
 
 - **Top-Level ABI (`include/linux/kho/abi/kvm.h`)**:
-  `struct kvm_vcpu_ser` records the `vcpu_id`, `flags` (such as
-  `KVM_VCPU_LUO_FLAG_CARETAKER`), the LUO token of the associated VM
-  (`vm_token`), a KHO pointer to the architecture-specific state buffer
-  (`arch_state`), and, when Caretaker is active, a KHO pointer to the Caretaker
-  control block (`cb`).
+  `struct kvm_vcpu_ser` records the vCPU identifier, preservation flags (such as
+  `KVM_VCPU_LUO_FLAG_CARETAKER`), the LUO token of the parent VM (`vm_token`),
+  and KHO pointers to the architecture state buffer (`arch_state`) and Caretaker
+  control block (`cb`):
+
+  ```c
+  struct kvm_vcpu_ser {
+          u32 vcpu_id;
+          u32 flags;
+          u64 vm_token;
+          DECLARE_KHOSER_PTR(arch_state, struct kvm_vcpu_arch_ser *);
+          DECLARE_KHOSER_PTR(cb, struct kvm_caretaker_cb_ser *);
+  } __packed;
+  ```
+
 - **uAPI-Backed Architectural State (`struct kvm_vcpu_arch_ser`)**:
   To avoid exposing internal kernel structures across `kexec`, the kernel
   serializes vCPU state into KHO-preserved pages using existing KVM uAPI
   structures:
-  - **x86 (`include/linux/kho/abi/kvm_x86.h`)**: Contains `kvm_regs`,
-    `kvm_sregs`, `kvm_mp_state`, `kvm_xcrs`, `kvm_lapic_state`, `kvm_xsave`
-    (64-byte aligned for in-place hardware `XSAVE64`/`XRSTOR64`),
-    `kvm_vcpu_events`, `kvm_debugregs`, `kvm_clock_data`, and a dynamic array of
-    `kvm_msr_entry` (`msrs[]`, covering KVM's `msrs_to_save` and `emulated_msrs`
-    via `kvm_num_msrs_to_save()` / `kvm_get_msr_to_save_index()`) followed by
-    `cpuid_nent` `struct kvm_cpuid_entry2` entries.
-  - **ARM64 (`include/linux/kho/abi/kvm_arm64.h`)**: Contains `kvm_regs`,
-    `kvm_mp_state`, `kvm_vcpu_events`, `kvm_vcpu_init` (the guest feature
-    bitmap), and a dynamically sized array of `struct kvm_one_reg` (`sysregs[]`,
-    storing the register `id` and 64-bit value in `addr`). During `.preserve()`,
-    the kernel enumerates all architectural and VGICv3 CPU interface system
-    registers via `kvm_arm_get_sys_reg_indices()` and reads/writes them using
-    in-kernel accessors (`kvm_arm_sys_reg_read()` / `kvm_arm_sys_reg_write()`)
-    separated from `put_user()` / `get_user()`.
+  - **x86 (`include/linux/kho/abi/kvm_x86.h`)**:
+
+    ```c
+    struct kvm_vcpu_arch_ser {
+            struct kvm_regs regs;
+            struct kvm_sregs sregs;
+            struct kvm_mp_state mp_state;
+            u32 pad;
+            struct kvm_xcrs xcrs;
+            struct kvm_lapic_state lapic;
+            u8 pad_xsave[40];
+            struct kvm_xsave xsave;
+            struct kvm_vcpu_events events;
+            struct kvm_debugregs debugregs;
+            struct kvm_clock_data clock;
+            u32 num_msrs;
+            u32 cpuid_nent;
+            struct kvm_msr_entry msrs[];
+    } __packed;
+    ```
+
+    `xsave` is 64-byte aligned so the Caretaker can execute hardware `XSAVE64`
+    and `XRSTOR64` directly in place, and `msrs[num_msrs]` (populated from KVM's
+    `msrs_to_save` and `emulated_msrs` lists) is immediately followed in memory
+    by `cpuid_nent` `struct kvm_cpuid_entry2` entries.
+
+  - **ARM64 (`include/linux/kho/abi/kvm_arm64.h`)**:
+
+    ```c
+    struct kvm_vcpu_arch_ser {
+            struct kvm_regs regs;
+            struct kvm_mp_state mp_state;
+            u32 pad;
+            struct kvm_vcpu_events events;
+            struct kvm_vcpu_init init;
+            u32 num_sysregs;
+            u32 reserved;
+            struct kvm_one_reg sysregs[];
+    } __packed;
+    ```
+
+    `sysregs[num_sysregs]` stores each system and VGICv3 CPU interface
+    register's `id` and 64-bit value (in `addr`), enumerated via
+    `kvm_arm_get_sys_reg_indices()` and read/written using in-kernel accessors
+    (`kvm_arm_sys_reg_read()` / `kvm_arm_sys_reg_write()`).
 
 When a LUO session contains preserved `vmfd` and `vcpufd` descriptors *without*
 preserved physical CPUs, `.preserve()` serializes the vCPU into
