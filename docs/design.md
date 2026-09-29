@@ -918,7 +918,7 @@ VM-exits via `kvm_caretaker_handle_exit()` (`ops->decode_exit()` and
   interface registers, and the virtual timer, and uses the EL2 physical timer
   (`CNTHP_CVAL_EL2`) for quantum deadlines.
 
-### 6.4 Example VM-Exits Implemented in RFCv1
+### 6.4 Implemented VM-Exits
 
 While the initial upstream landing should not implement any guest VM-exit
 emulation (stalling on any synchronous VM-exit until the incoming kernel
@@ -999,440 +999,188 @@ Caretaker is the non-preemptible inner part of `vcpu_enter_guest()`, and that
 `vmx_exit_handlers_fastpath()` / `svm_exit_handlers_fastpath()` already provide
 a blueprint for exits that can be handled with interrupts disabled.
 
-#### Specific VM-Exits Are Not Architectural (Zero-Exit Baseline)
+#### Zero-VM-Exit Baseline
 
-First, it is important to separate the **Caretaker execution mechanism** from
-**which specific VM-exits are emulated during the gap**.
-
-In RFCv1, the architecture backends implement a small set of exit handlers
-(such as 8250 COM1 UART TX/RX polling, `CPUID`, `RDTSC`, and basic MSR or GICv3
-SGI accesses) so that interactive console demos and test workloads can run
-during `kexec`. However, those specific exit handlers are **not** essential to
-the core architecture and do not need to be part of initial upstreaming.
-
-An initial upstream merge can implement **zero VM-exit emulation**:
-- As long as a guest vCPU is executing compute instructions in guest mode (or
-  handling timers and interrupts in silicon via hardware virtualization
-  features), it continues running across `kexec` without exiting.
-- If the guest triggers *any* synchronous VM-exit (other than `oncore` quantum
-  preemption), the Caretaker does not attempt to decode or emulate the
-  instruction; it serializes state, returns `ONCORE_EXIT_STALL`, and waits in a
-  low-power loop until the incoming kernel finishes booting and reclaims the
-  vCPU, where standard KVM handles the pending exit normally.
-
-Even with a zero-exit or minimal-exit baseline, however, the Caretaker still
-requires world-switch assembly (`caretaker_vmenter.S`), guest/host register
-context switching, and hardware control structure (`VMCS` / `VMCB` / EL2 sysreg)
-management. In RFCv1, this code is duplicated rather than shared with
-`vcpu_enter_guest()` and `vmx/svm_exit_handlers_fastpath()`.
+All three layers and the Intel VMX, AMD SVM, and ARM64 VHE backends can be
+upstreamed without implementing a single guest VM-exit handler. While in the
+Caretaker, vCPUs continue executing in guest mode (including timers and
+interrupts handled in silicon), stall (`ONCORE_EXIT_STALL`) on the first
+synchronous VM-exit without advancing `RIP`/`PC`, and resume execution of the
+faulting instruction in standard KVM once adopted by the incoming kernel.
 
 #### Why Sharing Code Directly with KVM Is Problematic
 
-Directly calling `vcpu_enter_guest()`, `vmx_vcpu_run()`, `svm_vcpu_run()`, or
-`vmx/svm_exit_handlers_fastpath()` from the Caretaker runs into four
-constraints:
+Directly calling `vcpu_enter_guest()`, `vmx/svm_vcpu_run()`, or
+`vmx/svm_exit_handlers_fastpath()` from the Caretaker is problematic because the
+Caretaker executes in an isolated address space while the rest of the host
+kernel is torn down:
 
-1. **Section and Compiler Isolation (`.text.cpu_preserved`)**:
-   Any code executed while the outgoing kernel is torn down must reside in
-   `.text.cpu_preserved` (so it is relocated outside KHO Scratch and mapped into
-   the session's isolated address space) and must be compiled without stack
-   protectors, jump tables, ftrace/mcount hooks, sanitizers, or
-   retpolines/return thunks. Annotating existing functions across
-   `arch/x86/kvm/` or `arch/arm64/kvm/` with `__cpu_preserved_text` is fragile:
-   if a shared KVM function makes even one transitive call to an unannotated
-   helper (`WARN_ON_ONCE()`, `printk()`, tracepoints,
-   `static_branch_unlikely()`, `rcu_read_lock()`, or a compiler-generated
-   out-of-line library routine), the preserved CPU will jump into unmapped
-   memory during `kexec` and fault.
-2. **Deep Coupling to `struct kvm_vcpu` and `struct kvm`**:
+1. **Isolated Code Section (`.text.cpu_preserved`)**:
+   All Caretaker code must reside in `.text.cpu_preserved` and compile without
+   stack protectors, jump tables, ftrace, sanitizers, or return thunks. If a
+   shared KVM function makes even a single transitive call to an unannotated
+   helper (`WARN_ON_ONCE()`, tracepoints, `static_branch_unlikely()`, or
+   out-of-line library routines), the CPU jumps into unmapped kernel text during
+   `kexec` and faults.
+2. **Unmapped `struct kvm_vcpu` and `struct kvm`**:
    KVM's entry/exit paths and fastpath handlers take `struct kvm_vcpu *` and
-   dereference `vcpu->kvm`, `vcpu->arch`, `mmu`, `apic`, `memslots`, and host
-   kernel heap pointers (`kmalloc`/`vmalloc`). Those structures live in the
-   host kernel's linear direct map (`PAGE_OFFSET`), which is intentionally
-   unmapped in the session's isolated address space to guarantee memory
-   isolation between the preserved CPUs and the booting kernel.
-3. **Host OS Runtime Assumptions**:
-   Standard KVM code assumes a valid Linux task context (`current`), host
-   per-CPU variables (`%gs` on x86, `TPIDR_EL1` on ARM64), preemption tracking,
-   lockdep, and RCU. On a preserved CPU that is offline and `!cpu_present(cpu)`,
-   running on a standalone 16KB preserved stack across `kexec`, none of those
-   facilities exist.
-4. **Cross-Kernel Struct Layout Drift**:
-   Internal kernel structures (`struct kvm_vcpu`, `struct vcpu_vmx`,
-   `struct vcpu_svm`) are not an ABI and can change size or field offsets
-   between the outgoing and incoming kernels. While the outgoing kernel's
-   `.text.cpu_preserved` only executes until `KVM_CARETAKER_STOPPED`, the
-   handoff boundary to the incoming kernel must still translate into a fixed KHO
-   ABI (`struct kvm_vcpu_arch_ser`).
+   chase pointers into `vcpu->kvm`, `mmu`, `apic`, and `memslots`. Those heap
+   structures live in the host linear map, which is unmapped in the session's
+   isolated address space.
+3. **No Linux Task or Per-CPU Runtime**:
+   Standard KVM code relies on `current`, host per-CPU variables (`%gs` on x86,
+   `TPIDR_EL1` on ARM64), preemption tracking, and RCU, none of which exist on
+   an offlined (`!cpu_present`) CPU running on a standalone 16KB stack across
+   `kexec`.
+4. **Cross-Kernel ABI Boundary**:
+   Internal structs (`struct kvm_vcpu`, `struct vcpu_vmx`, `struct vcpu_svm`)
+   can change layout between kernels, so the handoff to the incoming kernel must
+   serialize into a fixed KHO ABI (`struct kvm_vcpu_arch_ser`).
 
-#### Candidate Approaches for Code Sharing
+#### KVM Caretaker VM-Exits Code Sharing
 
-We must converge with upstream maintainers on how to balance code reuse against
-isolation safety. The primary options under consideration are:
+In order not to re-implement the hypervisor and to avoid code duplication, it is
+better to share guest entry/exit and VM-exit handling code between KVM and the
+Caretaker through a unified build and data-structure model across all
+`.text.cpu_preserved` code (`cpu_preserve`, `oncore`, and the Caretaker):
 
-- **Option 1: Strict Zero/Minimal Exit Policy + Hardware Virtualization
-  Offload**
-  - Keep the Caretaker restricted to world-switch entry/exit and quantum
-    preemption, and rely on hardware virtualization features (Intel APICv /
-    Posted Interrupts / IPI virtualization, AMD AVIC, ARM64 GICv4.1 direct
-    vLPI/vSGI injection, and direct timer passthrough) to keep guests running
-    without VM-exits. Any guest action that forces a software VM-exit stalls
-    (`ONCORE_EXIT_STALL`) until the incoming kernel re-attaches.
-  - *Trade-off*: Eliminates exit-handler duplication and keeps the preserved
-    attack surface minimal, though each architecture still needs a small
-    world-switch assembly stub (or shared macro) and workloads without hardware
-    interrupt/timer offload will stall upon their first timer or IPI exit.
-- **Option 2: Refactoring Low-Level World-Switch Macros and Stateless
-  Primitives**
-  - Factor KVM's low-level assembly (`vmx/vmenter.S`, `svm/vmenter.S`, ARM64 hyp
-    entry) and leaf register/VMCS/VMCB helpers so they operate on a compact,
-    self-contained register/hardware-context struct (embedded in both
-    `struct kvm_vcpu_arch` and the Caretaker page) rather than taking a full
-    `struct kvm_vcpu *`.
-  - Share those routines via assembly macros or `static __always_inline` header
-    helpers that compile into both standard `.text` and `.text.cpu_preserved`,
-    paired with `objtool` verification that `.text.cpu_preserved` contains no
-    relocations to external sections.
-  - *Trade-off*: Addresses duplicate `vmenter.S` and low-level register
-    save/restore logic without pulling `struct kvm_vcpu` or host heap
-    dependencies into the isolated address space, at the cost of refactoring
-    KVM's low-level entry/exit assembly.
-- **Option 3: Adopting the ARM64 KVM `nvhe` Dual-Compilation Model**
-  - ARM64 KVM already solves a similar isolation problem for nVHE/pKVM EL2
-    (`arch/arm64/kvm/hyp/nvhe/`), where shared KVM C/assembly files are compiled
-    a second time with dedicated flags (`-fno-stack-protector`, disabled
-    instrumentation, symbol prefixing) into an isolated linker section
-    (`.hyp.text`) with build-time checks prohibiting references to host kernel
-    symbols.
-  - Applying this pattern to `.text.cpu_preserved` would allow compiling shared,
-    self-contained KVM world-switch and fastpath translation units into both KVM
-    and Caretaker with compiler- and `objtool`-enforced isolation.
-  - *Trade-off*: Established upstream pattern on ARM64, though introducing a
-    similar split-compilation boundary into `arch/x86/kvm/` requires
-    refactoring.
-- **Option 4: Mapping Outgoing `struct kvm_vcpu` into the Session's Isolated
-  Address Space During the Gap**
-  - Because the code running in `.text.cpu_preserved` during the `kexec` window
-    belongs to the *outgoing* kernel image, its struct layout matches the
-    outgoing kernel's `struct kvm_vcpu`. If `struct kvm_vcpu` (and its immediate
-    sub-structures) are preserved in KHO and mapped into the session's isolated
-    address space (`struct cpu_preserved_as_ser`), outgoing
-    `.text.cpu_preserved` code can operate on `struct kvm_vcpu *` during the gap
-    and serialize into the versioned KHO ABI (`struct kvm_vcpu_arch_ser`) only
-    when transitioning to `KVM_CARETAKER_STOPPED` for the incoming kernel.
-  - *Trade-off*: Avoids inventing parallel per-arch context structs for the
-    runtime loop, but still requires auditing every shared function to ensure it
-    never chases unmapped pointers (`vcpu->kvm`, `memslots`), touches `current`
-    or per-CPU variables, or invokes unpreserved kernel helpers.
+1. **Common Hardware Context Data Structures**:
+   Factor KVM's low-level world-switch assembly (`vmx/vmenter.S`,
+   `svm/vmenter.S`, ARM64 hyp entry) and leaf register/VMCS/VMCB/sysreg helpers
+   to operate on a small, self-contained hardware context struct (embedded in
+   both `struct kvm_vcpu_arch` and the Caretaker runtime page) rather than
+   `struct kvm_vcpu *`. Because standard kernel `.text` can call directly into
+   `.text.cpu_preserved` (just not the other way around), stateless primitives
+   can either be called directly in `.text.cpu_preserved` from normal KVM (via a
+   `cpu_preserved_sym(fn)` macro) or dual-compiled when normal KVM wants
+   standard compiler instrumentation.
+2. **Partial Linking and Symbol Prefixing (`nvhe` Build Pattern)**:
+   Follow the `arch/arm64/kvm/hyp/nvhe/` build model for all preserved objects:
+   compile preserved `.c` and `.S` files (including shared KVM files and core
+   library routines such as `memcpy`, `memset`, and `memmove`) with isolated
+   compiler flags (`-fno-stack-protector`, disabled `ftrace`/sanitizers),
+   partially link them (`ld -r`) with a linker script that places `.text` and
+   `.rodata` into `.text.cpu_preserved`, and run
+   `objcopy --prefix-symbols=__cpu_preserved_`. This removes the need for custom
+   `cpu_preserved_memcpy()` / `memmove()` / `memset()` wrappers and per-function
+   `__cpu_preserved_text` annotations, and ensures that even compiler-emitted
+   implicit calls to `memcpy` or `memset` resolve to `__cpu_preserved_memcpy`
+   inside `.text.cpu_preserved`.
+3. **Link-Time and `objtool` Isolation Verification**:
+   Because `objcopy --prefix-symbols=__cpu_preserved_` also renames *undefined*
+   symbol references inside the partially linked object, any accidental call
+   from preserved code to an unpreserved kernel symbol (such as `printk` or an
+   unshared KVM helper) becomes an undefined reference to
+   `__cpu_preserved_printk` and fails the `vmlinux` link immediately,
+   complemented by `objtool` section checks.
 
-### 7.2 Unresolved Items from the Initial LKML Discussion
+### 7.2 Bare-Metal Platform Considerations
 
-Several points raised during the [initial proposal discussion][initial-proposal]
-were either deferred in RFCv1 or implemented differently and warrant further
-discussion:
+1. **CPU Enumeration and Hardware IDs**:
+   `cpu_preserve` and `oncore` currently index CPUs by Linux logical CPU ID,
+   which stays stable across `kexec` when the incoming kernel parses the same
+   ACPI MADT or Device Tree tables with the same boot parameters. To harden
+   against enumeration or command-line changes across `kexec`, `cpu_preserve`
+   can either key preserved CPUs directly by hardware CPU ID (`x2APIC ID` on
+   x86, `MPIDR_EL1` on ARM64), verify the hardware ID during
+   `cpu_preserve_retrieve()`, or reject command-line options (`maxcpus=`,
+   `possible_cpus=`, `nr_cpus=`) that alter CPU enumeration when preserved CPUs
+   are present.
+2. **Platform Events (SMIs, MCEs, and SErrors)**:
+   Preserved CPUs avoid deep C-states (`PAUSE` / `WFE`) and install standalone
+   exception vectors (`x86_preserved_idt`, `VBAR_EL2`). For bare-metal
+   hardening:
+   - **SMIs (x86)**: Handled transparently by firmware in SMRAM; on AMD SVM,
+     `INTERCEPT_SMI` should be cleared (or `SVM_EXIT_SMI` ignored) so an SMI
+     does not stall the vCPU.
+   - **MCEs and Host Exceptions**: On x86, `#MC` and synchronous host fault
+     vectors (`#DF`, `#GP`, `#PF`) in `x86_preserved_idt` should park the CPU in
+     the exit-check loop rather than returning via `iretq`. On ARM64, a minimal
+     preserved `VBAR_EL2` should be installed unconditionally in
+     `arch_cpu_preserved_park_init()` so EL2 exceptions and SErrors park safely
+     even without `CONFIG_KVM_CARETAKER`.
 
-1. **Pre-`kexec` Memory Invalidation and MMU Notifiers While Detached**:
-   Once `LIVEUPDATE_SESSION_PRESERVE_FD` is called on a `vcpufd`, the vCPU
-   begins executing inside the Caretaker on an offlined (`!cpu_present`)
-   physical CPU while the outgoing kernel and userspace are still running prior
-   to `kexec`. As Paolo Bonzini pointed out, if a buggy or malicious userspace
-   process performs an operation that invalidates guest mappings before `kexec`
-   (such as `madvise(MADV_FREE)` or `munmap()`), standard KVM MMU notifiers and
-   `kvm_flush_remote_tlbs()` will not kick the detached Caretaker CPU. The
-   outgoing kernel's MMU notifier path must be wired to force an immediate
-   VM-exit via IPI (`KVM_CARETAKER_STOPPING`) and abort Caretaker execution if
-   secondary page tables are invalidated while detached.
-2. **Kernel Remote Trace Ring Buffers vs. Custom Telemetry Struct**:
-   RFCv1 uses a custom `struct kvm_caretaker_telemetry_ser` in the KHO ABI
-   exposed via debugfs (`caretaker_telemetry`). In the initial discussion, Paolo
-   suggested using the kernel's remote trace ring buffers (introduced for
-   hypervisor/pKVM tracing) instead: the outgoing kernel allocates a remote ring
-   buffer preserved via KHO, the Caretaker acts as a lockless producer writing
-   trace events during the gap, and the incoming kernel attaches the buffer back
-   to the tracing subsystem upon retrieval.
-3. **`HLT` / Idle Exit Handling and `oncore` $M > N$ Multiplexing vs. 1:1
-   Pinning**:
-   In the initial discussion, it was suggested that initial support should
-   assume a 1:1 mapping of active vCPUs to isolated physical CPUs, and that
-   `HLT` exits during the gap should either be skipped or have their hardware
-   intercepts disabled (`HLT`/`PAUSE`/`MONITOR`/`MWAIT`, e.g. via
-   `KVM_CAP_X86_DISABLE_EXITS`). RFCv1 instead introduced the `oncore` scheduler
-   to support $M > N$ oversubscription and kept `HLT`/`WFI` intercepts enabled
-   so an idle vCPU yields its quantum to other runnable vCPUs on the same pCPU.
-   Whether $M > N$ multiplexing during the brief `kexec` window justifies the
-   complexity of `oncore`, versus enforcing 1:1 vCPU-to-pCPU pinning (and
-   leaving any excess vCPUs suspended in RAM across `kexec`) with idle
-   intercepts disabled, should be decided with maintainers.
-4. **Moving APIC Emulation into Standard KVM Fastpaths**:
-   For multi-vCPU guests without hardware IPI virtualization (Intel APICv/IPIv,
-   AMD AVIC), moving a subset of APIC emulation (such as `APIC_ICR` / IPI
-   delivery) into `vmx_exit_handlers_fastpath()` and
-   `svm_exit_handlers_fastpath()` was proposed as a standalone improvement that
-   benefits both normal KVM and the Caretaker. In RFCv1, ARM64 emulates
-   `ICC_SGI1R_EL1` in the Caretaker and Intel CPUs with IPIv handle x2APIC
-   `APIC_ICR` writes in hardware without VM-exits, whereas x86 without hardware
-   IPI virtualization treats intercepted `APIC_ICR` writes as a blocking exit
-   (`ONCORE_EXIT_STALL`).
-5. **Decoupling Asynchronous vCPU Execution from `kexec` (`KVM_RUN_ASYNC` / VMM
-   Upgrade)**:
-   Paolo Bonzini and David Woodhouse discussed decoupling detached vCPU
-   execution from `kexec` so that a userspace VMM can detach, restart or upgrade
-   itself, and re-attach to running vCPUs without a kernel reboot, potentially
-   staged as: (a) `ioctl(KVM_RUN_ASYNC)` running the vCPU in a
-   `struct vhost_task` kernel thread, (b) `vmfd`/`vcpufd` handoff to a new `mm`,
-   (c) ASI during normal `KVM_RUN` (enabled via a module parameter), and (d)
-   `kexec` serialization on top. RFCv1 supports intra-kernel start/cancel loops
-   through LUO session preservation and retrieval, but does not implement
-   `KVM_RUN_ASYNC` (`vhost_task`) or always-on ASI during normal `KVM_RUN`.
-6. **Cross-Kernel Feature and Capability Negotiation on Reattachment**:
-   When the incoming kernel adopts a preserved VM during `.retrieve()`, it needs
-   formal feature negotiation to verify that the new kernel and KVM module
-   support all hardware capabilities and register states used by the preserved
-   VM, terminating the VM (or aborting before the point of no return) if an
-   incompatibility is detected.
+### 7.3 Nested Virtualization Support
 
-### 7.3 Bare-Metal Platform Considerations
+RFCv1 rejects nested virtualization (`is_guest_mode(vcpu)` on x86,
+`vcpu_has_nv(vcpu)` on ARM64) with `-EOPNOTSUPP`. Supporting it requires two
+additions:
 
-Running preserved physical CPUs across a bare-metal `kexec` introduces two
-platform-level considerations beyond virtualized test environments:
+1. **KHO State and Shadow TDP Preservation**:
+   Serialize nested hypervisor state in `struct kvm_vcpu_arch_ser`
+   (`struct kvm_nested_state` via `kvm_nested_ops.get_state()`/`set_state()` on
+   x86, and virtual EL2 system registers via `state->sysregs[]` on ARM64) and
+   preserve active nested shadow TDP / Stage-2 page tables (`vmcs02.EPTP`,
+   `vmcb02.ncr3`, nested `VTTBR_EL2`) alongside the VM's primary TDP mappings.
+2. **Run Current Mode, Stall on Nested World Switches**:
+   Rather than pulling KVM's nested state machine into `.text.cpu_preserved`,
+   the Caretaker keeps the vCPU executing in whichever mode (L1 `vmcs01`/`vmcb01`
+   or L2 `vmcs02`/`vmcb02`) was active at `.preserve()` time. Any L1 -> L2 entry
+   (`VMLAUNCH`, `VMRESUME`, `VMRUN`) or L2 exit that must be reflected to L1
+   stalls (`ONCORE_EXIT_STALL`) until the incoming kernel adopts the vCPU and
+   emulates the nested transition in standard KVM.
 
-1. **CPU Enumeration Stability and Hardware Identifier Validation**:
-   - **Logical CPU Stability Across `kexec`**: RFCv1 indexes `pcpus[]` by Linux
-     logical CPU ID (`0 .. nr_cpu_ids - 1`) and passes logical CPU bitmasks in
-     `cpu_flb_v1` and `oncore_session_ser`. Just as PCI/VFIO Live Update
-     (`pci_flb_v1`) relies on PCI `domain:bus:dev.fn` (BDF) stability across
-     `kexec`, logical CPU numbering is invariant across a standard `kexec`
-     because platform firmware does not re-run and the incoming kernel parses
-     the exact same in-memory ACPI MADT or Device Tree tables in the same
-     deterministic order (with the same bootstrap processor, CPU 0).
-   - **How Hardware ID Validation Can Be Added**: To guard against kernel
-     command-line changes (such as `maxcpus=` or `possible_cpus=`) or future
-     changes in kernel topology enumeration order between the outgoing and
-     incoming kernels, `struct cpu_preserved_ser` can record the hardware
-     CPU identifier alongside the logical CPU index (`x2APIC ID` /
-     `cpu_physical_id(cpu)` on x86, and `MPIDR_EL1 & MPIDR_HWID_BITMASK` /
-     `cpu_logical_map(cpu)` on ARM64). During `cpu_preserve_retrieve()`, the
-     incoming kernel can cross-check that its `setup_arch()`
-     logical-to-physical mapping for `cpu` matches the preserved hardware ID
-     before adopting the core.
+### 7.4 Paravirtual Devices
 
-2. **Firmware and Platform Events (SMIs, MCEs, and ARM64 SErrors)**:
-   - **C-State Control and Standalone Exception Vectors**: Deep C-state
-     transitions that could depend on ACPI power management state are avoided by
-     using `cpu_relax()` (`PAUSE`) on x86 and `wfe()` on ARM64 in
-     `arch_cpu_preserved_park_wait()`, and requesting maximum autonomous
-     performance (`MSR_HWP_REQUEST`, `MSR_IA32_ENERGY_PERF_BIAS`,
-     `MSR_AMD_CPPC_REQ`) before entering the preserved runtime. Both
-     architectures switch to standalone descriptor and vector tables in
-     `.text.cpu_preserved` / `.data.cpu_preserved` (`x86_preserved_idt` and
-     `caretaker_x86_idt` on x86, `caretaker_hyp_vector` in `VBAR_EL2` and
-     `VBAR_EL1` on ARM64) so an asynchronous interrupt or exception during
-     `kexec` never vectors into torn-down host kernel text.
-   - **How Remaining Bare-Metal Event Corner Cases Can Be Solved**:
-     - *SMIs (x86)*: System Management Interrupts are serviced transparently by
-       platform firmware in SMM (out of BIOS-reserved SMRAM) and resume via
-       `RSM`. On Intel VMX, SMM returns directly to the guest or Caretaker. On
-       AMD SVM, if `INTERCEPT_SMI` is inherited from `vmcb01`, the CPU triggers
-       a `VMEXIT` (`SVM_EXIT_SMI`) after `RSM` completes; adding `SVM_EXIT_SMI`
-       to `svm_caretaker_decode_exit()` (or clearing `INTERCEPT_SMI` in the
-       Caretaker VMCB) allows the Caretaker to resume the guest immediately
-       rather than treating the exit as unhandled (`ONCORE_EXIT_STALL`).
-     - *MCEs and Synchronous Host Faults (x86)*: In RFCv1, vectors `0..31` in
-       `x86_preserved_idt` and `caretaker_x86_idt` return immediately via
-       `iretq` (`x86_preserved_iret_stub` / `x86_preserved_iret_err_stub`).
-       While `NMI` (vector 2) must `iretq` because x86 uses NMI IPIs to wake
-       preserved cores, a Machine Check Exception (`#MC`, vector 18) or
-       synchronous fault (`#DF`, `#GP`, `#PF`) in preserved host context would
-       re-fault in a loop or triple-fault if `MSR_IA32_MCG_STATUS.RIPV == 0`.
-       Pointing `#MC` and synchronous fault vectors in `x86_preserved_idt` and
-       `caretaker_x86_idt` to a dedicated preserved park stub (which clears
-       `MSR_IA32_MCG_STATUS`, records fault telemetry, and parks the core in the
-       exit-check loop) prevents a localized fault on one preserved core from
-       resetting the machine during `kexec`.
-     - *ARM64 SErrors and Unconditional `VBAR_EL2` Isolation*: On ARM64,
-       lower-EL SErrors (`caretaker_el1_error`) already exit guest mode, save
-       vCPU state, and stall the vCPU until the incoming kernel re-attaches,
-       while EL2 synchronous exceptions and EL2 SErrors vector to
-       `arm64_caretaker_handle_invalid()`, which records `ELR_EL2`, `ESR_EL2`,
-       and `FAR_EL2` and parks the core in a `wfe()` loop until reclaimed.
-       Moving a minimal default preserved vector table into
-       `arch/arm64/kernel/preserve_cpu.S` ensures `VBAR_EL2` and `VBAR_EL1` are
-       always isolated in `arch_cpu_preserved_park_init()` even when a core is
-       preserved without `CONFIG_KVM_CARETAKER`.
+While pass-through PCI/VFIO devices continue DMA in hardware during `kexec`,
+paravirtual `virtio` devices (`virtio-rng`, `virtio-net`, `virtio-blk`,
+`virtio-console`) normally trap into the userspace VMM on `QueueNotify` doorbell
+writes (`ioeventfd`), stalling the vCPU (`ONCORE_EXIT_STALL`) until the incoming
+VMM re-attaches. Four approaches can avoid or service these exits during the
+gap:
 
-### 7.4 Nested Virtualization Support
+1. **Architectural CPU Instructions (e.g., `virtio-rng`)**:
+   Exposing native hardware random instructions (`RDRAND`/`RDSEED` on x86,
+   `FEAT_RNG` on ARM64) lets the guest obtain entropy directly in guest mode
+   without relying on `virtio-rng` or a userspace VMM.
+2. **Posted `ioeventfd` Doorbell Absorption**:
+   Because `QueueNotify` writes are posted notifications that descriptors are
+   ready in guest RAM, the Caretaker can match registered `ioeventfd` GPA/PIO
+   ranges, mark the `ioeventfd` pending in preserved memory, and advance
+   `RIP`/`PC` so the vCPU keeps running other guest tasks; KVM then signals all
+   pending `ioeventfd`s upon VMM re-attachment.
+3. **Minimal In-Caretaker Servicing for Stateless Queues**:
+   For simple stateless devices (`virtio-rng` or `virtio-console` TX), a small
+   Caretaker helper mapped to the virtqueue ring pages in preserved guest RAM
+   can consume `avail` descriptors, fill or drain the buffer, and advance the
+   `used` index in place.
+4. **Forwarding Virtqueues or VM-Exits to Another VM or Accelerator Card**:
+   For stateful I/O (`virtio-net`, `virtio-blk`) or complex device exits, the
+   Caretaker (or guest virtqueues directly) can forward the request over shared
+   preserved memory or PCIe to an external endpoint that remains alive across
+   `kexec`, such as a dedicated service/driver VM running on its own preserved
+   CPUs or an off-host SmartNIC/DPU accelerator card.
 
-In RFCv1, preserving a guest VM that itself uses nested virtualization (an L1
-guest hypervisor running L2 VMs) is explicitly rejected with `-EOPNOTSUPP`:
-- **x86**: `kvm_arch_vcpu_luo_preserve()`, `vmx_caretaker_init()`, and
-  `svm_caretaker_init_page()` reject vCPUs currently in L2 guest mode
-  (`is_guest_mode(vcpu)`), and `struct kvm_vcpu_arch_ser` does not serialize
-  `struct kvm_nested_state`.
-- **ARM64**: `arm64_kvm_caretaker_preserve()` rejects vCPUs configured with
-  `KVM_ARM_VCPU_HAS_EL2` (`vcpu_has_nv(vcpu)`).
+### 7.5 Kernel Caretaker
 
-Adding nested virtualization support to OrphanVM divides into two layers (KHO
-state preservation and Caretaker runtime execution):
+Because CPU preservation (`cpu_preserve`) and on-core scheduling (`oncore`) are
+independent of KVM, the same infrastructure can support a **Kernel Caretaker**
+that keeps userspace threads running across a host `kexec` reboot.
 
-1. **KHO Architectural and MMU State Preservation**:
-   - **x86 (`struct kvm_nested_state`)**: KVM already provides internal helpers
-     backing `KVM_GET_NESTED_STATE` and `KVM_SET_NESTED_STATE`
-     (`kvm_nested_ops.get_state()` and `kvm_nested_ops.set_state()`), which
-     serialize the complete nested state (~4-8 KB per vCPU), including
-     guest-mode and pending-entry flags (`KVM_STATE_NESTED_GUEST_MODE`,
-     `KVM_STATE_NESTED_RUN_PENDING`, `KVM_STATE_NESTED_GIF_SET`), `vmxon_pa` /
-     `current_vmptr` (VMX) or `hsave_msr` / `vmcb12_gpa` (SVM), and the cached
-     `vmcs12` / `vmcb12` (plus `shadow_vmcs12`). Appending
-     `struct kvm_nested_state` to `struct kvm_vcpu_arch_ser` and invoking
-     `kvm_nested_ops.get_state()` on `.preserve()` and
-     `kvm_nested_ops.set_state()` on `.retrieve()` (prior to restoring segment
-     registers and MSRs) preserves the L1/L2 hypervisor state across `kexec`.
-   - **ARM64 (`FEAT_NV` / `FEAT_NV2`)**: Virtual EL2 system registers
-     (`VNCR_EL2` and trapped EL2 state in `vcpu->arch.ctxt`) are already exposed
-     through the `kvm_one_reg` interface and enumerated by
-     `kvm_arm_get_sys_reg_indices()` into `state->sysregs[]`.
-   - **Nested Shadow TDP / Stage-2 Page Tables**: When a vCPU is executing in L2
-     (`is_guest_mode(vcpu)`), hardware two-dimensional paging (`vmcs02.EPTP`,
-     `vmcb02.ncr3`, or nested `VTTBR_EL2`) points to a shadow TDP root that
-     composes L1's EPT/NPT/Stage-2 mappings with L0's Stage-2 mappings. To keep
-     an L2 vCPU running in the Caretaker across `kexec`,
-     `kvm_mmu_preserve_kho()` (x86) and `kvm_arch_vm_luo_preserve()` (ARM64)
-     must also walk and preserve the active nested shadow TDP page-table pages
-     via `kho_preserve_folio()`.
-
-2. **Caretaker Execution During the `kexec` Window (Run Current Mode, Stall on
-   Nested World Switches)**:
-   - Emulating L1 $\leftrightarrow$ L2 world switches (`VMLAUNCH`, `VMRESUME`,
-     `VMRUN`, and L2 $\rightarrow$ L1 nested VM-exits) inside
-     `.text.cpu_preserved` would require pulling thousands of lines of nested
-     hypervisor state machines (`arch/x86/kvm/vmx/nested.c`,
-     `arch/x86/kvm/svm/nested.c`) and dynamic shadow EPT page-table construction
-     into the Caretaker, conflicting with its zero-allocation, minimal-TCB
-     design.
-   - Instead, the Caretaker can keep the vCPU executing in whichever mode (L1 or
-     L2) was active at `.preserve()` time and stall only if a nested world
-     switch is required during the `kexec` window:
-     - **vCPU in L1 (`!is_guest_mode(vcpu)`)**: The Caretaker runs `vmcs01` /
-       `vmcb01` as usual. If the L1 hypervisor executes a nested virtualization
-       instruction (`VMLAUNCH`, `VMRESUME`, `VMRUN`, `VMPTRLD`) during `kexec`,
-       the Caretaker treats it as an unhandled architectural exit
-       (`ONCORE_EXIT_STALL`) and parks the vCPU until the incoming kernel
-       re-attaches and emulates the nested entry.
-     - **vCPU in L2 (`is_guest_mode(vcpu)`)**: The Caretaker loads and runs the
-       active `vmcs02` (VMX) or `vmcb02` (SVM) with the preserved nested shadow
-       TDP root so L2 compute continues across `kexec`. If L2 triggers an exit
-       that `vmcs12` / `vmcb12` requires reflecting to L1 (or faults on an
-       unmapped shadow EPT entry), the Caretaker stalls (`ONCORE_EXIT_STALL`),
-       syncs the active `vmcs02` / `vmcb02` guest state, and lets the incoming
-       kernel's full KVM (`nested_vmx_vmexit()` / `nested_svm_vmexit()`) reflect
-       the exit to L1 upon `.retrieve()`.
-
-### 7.5 Paravirtual `virtio` Devices and In-Kernel Alternatives (`virtio-rng`)
-
-While pass-through PCI/VFIO devices can continue DMA and polling I/O in
-hardware during the `kexec` window, paravirtual `virtio` devices (`virtio-rng`,
-`virtio-blk`, `virtio-net`, `virtio-console`, `virtio-balloon`, `virtio-vsock`)
-are emulated in the userspace VMM (or `vhost` workers) and require VMM
-involvement to service virtqueue kicks (`ioeventfd`) and inject completions
-(`irqfd`).
-
-A common example is **`virtio-rng`**, which is enabled by default in many QEMU
-and cloud VMM configurations to supply host entropy to the guest's `hwrng`
-subsystem. If a guest touches `virtio-rng` (or any other VMM-emulated `virtio`
-device) during the `kexec` window, it can populate virtqueue descriptors in
-guest RAM without trapping, but the subsequent MMIO or PIO write to the
-`QueueNotify` doorbell triggers a Stage-2/TDP fault or PIO exit. In RFCv1, any
-unmapped MMIO/PIO exit stalls the vCPU (`ONCORE_EXIT_STALL`) until the incoming
-kernel and userspace VMM re-attach.
-
-Addressing VMM-backed `virtio` devices such as `virtio-rng` during the `kexec`
-window involves three mechanisms:
-
-1. **Architectural CPU Alternatives (`RDRAND`/`RDSEED` and `FEAT_RNG` Instead of
-   `virtio-rng`)**:
-   - Modern x86 (`RDRAND`, `RDSEED`) and ARM64 (`FEAT_RNG`: `RNDR`, `RNDRRS`)
-     processors provide native hardware random number instructions that execute
-     inside the guest CPU without causing a VM-exit.
-   - Exposing these architectural instructions to the guest (or emulating them
-     in a few instructions inside `.text.cpu_preserved` if trapped) allows the
-     guest kernel (`arch_get_random_long()` / `crng`) and guest applications to
-     obtain hardware entropy across `kexec` without relying on `virtio-rng` or a
-     userspace VMM.
-
-2. **Posted `ioeventfd` Doorbell Absorption (Deferred VMM Notification)**:
-   - In the `virtio` specification, writing to the `QueueNotify` MMIO/PIO
-     register is a posted notification informing the backend that new
-     descriptors have been placed in guest RAM.
-   - When a guest background thread (such as `hwrng` polling `virtio-rng`, or an
-     asynchronous network/storage submission) writes a `QueueNotify` doorbell
-     during `kexec`, stalling the entire vCPU on the doorbell instruction is
-     unnecessary if the guest does not spin-wait on immediate completion.
-   - By exporting the VM's registered `ioeventfd` GPA/PIO doorbell ranges into a
-     compact table in the Caretaker control block, the Caretaker can absorb
-     `ioeventfd` writes in-place (marking the corresponding `ioeventfd` entry as
-     pending in preserved memory and advancing `RIP`/`PC`) so the vCPU continues
-     running other guest tasks, and KVM signals all pending `ioeventfd`s once
-     the incoming kernel and VMM re-attach.
-
-3. **Lightweight In-Kernel / Caretaker Virtqueue Servicing for Stateless
-   Devices**:
-   - For simple, stateless paravirtual devices like `virtio-rng` (where a guest
-     without `RDRAND`/`FEAT_RNG` might wait for a buffer to be filled) or
-     `virtio-console` transmit, an in-kernel handler or a minimal Caretaker
-     virtqueue helper mapped to the device's virtqueue pages in preserved guest
-     RAM can consume `avail` ring descriptors, fill `virtio-rng` buffers using
-     host hardware RNG instructions (or drain console output), and advance the
-     `used` ring index without VMM involvement.
-
-### 7.6 "Kernel Caretaker" for Preserved Userspace Processes (DPDK, gVisor)
-
-Because the architecture separates physical CPU preservation (`cpu_preserve`)
-and on-core workload scheduling (`oncore`) from the KVM-specific
-`KVM Caretaker`, the same infrastructure can support a **"Kernel Caretaker"**
-(Ring-3 / EL0 Caretaker) that keeps specially tailored host userspace processes
-executing across a `kexec` reboot without a virtual machine:
-
-1. **Target Workloads (DPDK, User-Space I/O Pollers, and gVisor)**:
-   - High-throughput user-space data planes such as **DPDK** (polling preserved
-     VFIO NIC queues out of HugeTLB/memfd memory), SPDK storage engines, or
-     real-time control loops spend 100% of their steady-state execution in
-     Ring 3 / EL0 without invoking kernel system calls.
-   - Similarly, user-space application kernels and sandboxes such as **gVisor**
-     (where the Sentry intercepts and services application system calls in user
-     space via `systrap` or shared memory over preserved memory mappings) can
-     continue running sandboxed workloads across a host kernel `kexec` as long
-     as they do not require a host kernel syscall during the brief reboot
-     window.
-
-2. **Execution Model Across `kexec` (Preserved Stack/Memory + Stall on Kernel
-   Entrance)**:
-   - **Preserved User Address Space**: The process places its code, stacks,
-     heap, and DMA/packet buffers in KHO-preserved memory (`memfd` / HugeTLB)
-     alongside preserved VFIO device BAR mappings. Its user-space page tables
-     (`PGD` on x86, `TTBR0_EL1` on ARM64), combined with the isolated
-     `.text.cpu_preserved` / `.data.cpu_preserved` trampoline mappings, are
-     preserved across `kexec` via the session's isolated address space
-     (`struct cpu_preserved_as_ser`).
-   - **Ring-3 / EL0 Trampoline**: Rather than entering a guest via
-     `VMLAUNCH`/`VMRUN`/`ERET`-to-EL1, the Kernel Caretaker `oncore` callback
-     switches to the preserved process's page tables and enters user mode in
-     Ring 3 (`SYSRET` / `IRETQ` on x86) or EL0 (`ERET` to EL0 on ARM64), with
-     `MSR_LSTAR` / `IDT` (x86) or `VBAR_EL1` (ARM64) pointing at standalone
-     entry vectors in `.text.cpu_preserved`.
-   - **Stall on Unsupported Kernel Entrance (`syscall` or Fault)**:
-     - While the thread executes in user space over pre-mapped preserved memory
-       and vDSO timekeeping (`RDTSC` / `CNTVCT_EL0`), it runs at native speed
-       across `kexec`.
-     - If the thread triggers an unsupported kernel entrance during the `kexec`
-       window (such as a host `syscall` (`SYSCALL`/`SVC`), a page fault (`#PF` /
-       Data Abort) on an unmapped address, or a synchronous exception), the
-       `.text.cpu_preserved` entry stub saves the thread's user register frame
-       (`pt_regs`) and FPU state into preserved memory and returns
-       `ONCORE_EXIT_STALL` (leaving the user instruction pointer at the trapping
-       instruction).
-     - Once the incoming kernel boots and re-attaches the preserved process/task
-       context via LUO, the new kernel services the pending `syscall` or page
-       fault through its standard handlers and resumes the process.
+1. **Target Workloads**:
+   - **Userspace Data Planes (DPDK, SPDK)**: Threads that poll preserved VFIO
+     NIC or storage queues in `memfd`/HugeTLB memory and run in user mode
+     without making kernel system calls.
+   - **Userspace Sandboxes (gVisor)**: Application kernels where the Sentry
+     services guest system calls in user space (`systrap` or shared memory) and
+     can keep running across `kexec` as long as it does not make a host kernel
+     syscall during the reboot window.
+2. **How It Works**:
+   - **Preserved User Page Tables**: The process's user-space mappings
+     (`memfd`/HugeTLB code, stack, heap, and VFIO BARs) are mapped alongside the
+     `.text.cpu_preserved` trampoline inside the session's isolated address
+     space (`struct cpu_preserved_as_ser`).
+   - **User-Mode Entry and Vectors**: the `oncore` job switches to the preserved
+     user page tables and enters user mode, with syscall and exception vectors
+     pointing to `.text.cpu_preserved` stubs.
+   - **Stall on Syscall or Page Fault**: As long as the thread stays in user
+     mode over pre-mapped memory and vDSO clocks (`RDTSC` / `CNTVCT_EL0`), it
+     runs across `kexec` without interruption. If it issues a host `syscall` or
+     faults on an unmapped page, the `.text.cpu_preserved` stub saves its user
+     registers (`pt_regs`) and FPU state and stalls (`ONCORE_EXIT_STALL`) with
+     the instruction pointer left on the trapping instruction; once the incoming
+     kernel adopts the task via LUO, it handles the pending syscall or fault
+     normally.
 
 [initial-proposal]: https://lore.kernel.org/all/afEwWZksU0Fw61oT@plex
 [rfcv1-series]: https://lore.kernel.org/all/20260920193650.3373435-1-pasha.tatashin@soleen.com
