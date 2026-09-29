@@ -853,6 +853,14 @@ class TargetRunner:
             log_info(f"[{self.target}] ovm_guest output: {out}")
 
             # 8. Sample post-resume progress (allow up to 30s for NanoVMM process launch & attach)
+            if self.preserves_pcpus:
+                attach_start = time.time()
+                while time.time() - attach_start < 15:
+                    rc, out, _ = self.ssh.run("cat /sys/devices/system/cpu/preserved 2>/dev/null", timeout=5)
+                    if rc == 0 and not out.strip():
+                        break
+                    time.sleep(0.2)
+
             recheck_start = time.time()
             recheck_timeout = max(30 if self.target in ("simics", "arm", "amd", "intel") else 15, int(self.args.duration) * 2 + 15)
             rate = 0.0
