@@ -1,0 +1,531 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 1080" width="1800" height="1080" font-family="'Inter', 'Roboto', 'Segoe UI', Arial, sans-serif">
+  <defs>
+    <!-- Standard SVG 1.1 Drop Shadows (compatible with librsvg, Chrome, Inkscape) -->
+    <filter id="shadow" x="-4%" y="-4%" width="108%" height="110%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="4" result="blur"/>
+      <feOffset in="blur" dx="0" dy="3" result="offsetBlur"/>
+      <feComponentTransfer in="offsetBlur" result="shadowAlpha">
+        <feFuncA type="linear" slope="0.08"/>
+      </feComponentTransfer>
+      <feMerge>
+        <feMergeNode in="shadowAlpha"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="shadow-sm" x="-3%" y="-3%" width="106%" height="108%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="2.5" result="blur"/>
+      <feOffset in="blur" dx="0" dy="2" result="offsetBlur"/>
+      <feComponentTransfer in="offsetBlur" result="shadowAlpha">
+        <feFuncA type="linear" slope="0.06"/>
+      </feComponentTransfer>
+      <feMerge>
+        <feMergeNode in="shadowAlpha"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Gradients -->
+    <linearGradient id="hostBg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f8fafc"/>
+      <stop offset="100%" stop-color="#f1f5f9"/>
+    </linearGradient>
+    <linearGradient id="vmHeaderBlue" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#1d4ed8"/>
+      <stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+    <linearGradient id="vmHeaderTeal" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#0f766e"/>
+      <stop offset="100%" stop-color="#0d9488"/>
+    </linearGradient>
+    <linearGradient id="vmHeaderPurple" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#6d28d9"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="flbGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#1e293b"/>
+      <stop offset="100%" stop-color="#334155"/>
+    </linearGradient>
+
+    <!-- Arrow Markers -->
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrowTeal" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#0d9488"/>
+    </marker>
+    <marker id="arrowPurple" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#7c3aed"/>
+    </marker>
+    <marker id="arrowSlate" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#475569"/>
+    </marker>
+
+    <!-- Reusable VM Monitor/Appliance Icon -->
+    <g id="vmIcon">
+      <rect x="0" y="0" width="28" height="20" rx="3" fill="none" stroke="#ffffff" stroke-width="2"/>
+      <line x1="6" y1="6" x2="22" y2="6" stroke="#bfdbfe" stroke-width="2"/>
+      <line x1="6" y1="11" x2="16" y2="11" stroke="#bfdbfe" stroke-width="2"/>
+      <line x1="10" y1="20" x2="18" y2="20" stroke="#ffffff" stroke-width="2"/>
+      <line x1="8" y1="24" x2="20" y2="24" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/>
+    </g>
+
+    <!-- Reusable CPU Chip Icon -->
+    <g id="chipIcon">
+      <rect x="4" y="4" width="16" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/>
+      <rect x="8" y="8" width="8" height="8" rx="1" fill="currentColor" opacity="0.25"/>
+      <line x1="8" y1="1" x2="8" y2="4" stroke="currentColor" stroke-width="1.5"/>
+      <line x1="12" y1="1" x2="12" y2="4" stroke="currentColor" stroke-width="1.5"/>
+      <line x1="16" y1="1" x2="16" y2="4" stroke="currentColor" stroke-width="1.5"/>
+      <line x1="8" y1="20" x2="8" y2="23" stroke="currentColor" stroke-width="1.5"/>
+      <line x1="12" y1="20" x2="12" y2="23" stroke="currentColor" stroke-width="1.5"/>
+      <line x1="16" y1="20" x2="16" y2="23" stroke="currentColor" stroke-width="1.5"/>
+      <line x1="1" y1="8" x2="4" y2="8" stroke="currentColor" stroke-width="1.5"/>
+      <line x1="1" y1="12" x2="4" y2="12" stroke="currentColor" stroke-width="1.5"/>
+      <line x1="1" y1="16" x2="4" y2="16" stroke="currentColor" stroke-width="1.5"/>
+      <line x1="20" y1="8" x2="23" y2="8" stroke="currentColor" stroke-width="1.5"/>
+      <line x1="20" y1="12" x2="23" y2="12" stroke="currentColor" stroke-width="1.5"/>
+      <line x1="20" y1="16" x2="23" y2="16" stroke="currentColor" stroke-width="1.5"/>
+    </g>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1800" height="1080" fill="#ffffff"/>
+
+  <!-- Title Header -->
+  <text x="40" y="44" font-size="27" font-weight="800" fill="#0f172a" letter-spacing="-0.4">OrphanVM Architecture</text>
+  <text x="40" y="70" font-size="15" font-weight="500" fill="#475569">VMs, LUO Sessions, Per-Session Isolated Address Spaces (cpu_preserved_as_ser), On-Core Scheduler, Global FLB &amp; Physical CPU Pools</text>
+
+  <!-- Legend in Top Right -->
+  <g transform="translate(1155, 18)">
+    <rect x="0" y="0" width="610" height="58" rx="8" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2"/>
+    <!-- AS Scope Legend -->
+    <rect x="14" y="12" width="28" height="16" rx="3" fill="#eff6ff" stroke="#2563eb" stroke-width="2" stroke-dasharray="5,3"/>
+    <text x="50" y="25" font-size="12" font-weight="600" fill="#1e293b">Isolated Address Space Scope (cpu_preserved_as_ser)</text>
+    <!-- Stage-2 / TDP Scope Legend -->
+    <rect x="14" y="34" width="28" height="14" rx="3" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+    <text x="50" y="45" font-size="12" font-weight="600" fill="#1e293b">Stage-2 / EPT Guest Memory Scope (kvm_luo_ser)</text>
+    <!-- Shared FLB Legend -->
+    <rect x="368" y="12" width="24" height="16" rx="3" fill="#1e293b"/>
+    <text x="400" y="25" font-size="12" font-weight="600" fill="#1e293b">Global FLB Shared Runtime (.cpu_preserved.*)</text>
+    <!-- Unpreserved Host Legend -->
+    <rect x="368" y="34" width="24" height="14" rx="3" fill="#f1f5f9" stroke="#64748b" stroke-width="1.5"/>
+    <text x="400" y="45" font-size="12" font-weight="600" fill="#475569">Host Kexec Domain (Unmapped in AS)</text>
+  </g>
+
+  <!-- ======================================================================= -->
+  <!-- OUTER PHYSICAL HOST MACHINE CONTAINER                                   -->
+  <!-- ======================================================================= -->
+  <rect x="28" y="88" width="1744" height="968" rx="14" fill="url(#hostBg)" stroke="#94a3b8" stroke-width="2" filter="url(#shadow)"/>
+  <text x="50" y="116" font-size="13.5" font-weight="800" fill="#334155" letter-spacing="1.2">PHYSICAL HOST MACHINE</text>
+
+  <!-- ======================================================================= -->
+  <!-- LEFT COLUMN: UNPRESERVED HOST KEXEC DOMAIN (Housekeeping pCPUs)         -->
+  <!-- ======================================================================= -->
+  <g transform="translate(48, 130)">
+    <rect x="0" y="0" width="262" height="904" rx="10" fill="#ffffff" stroke="#cbd5e1" stroke-width="2" filter="url(#shadow-sm)"/>
+    <rect x="0" y="0" width="262" height="42" rx="10" fill="#475569"/>
+    <rect x="0" y="22" width="262" height="20" fill="#475569"/>
+    <text x="131" y="27" text-anchor="middle" font-size="14" font-weight="700" fill="#ffffff">HOST KEXEC DOMAIN</text>
+
+    <!-- Userspace VMM / Orchestrator -->
+    <rect x="14" y="56" width="234" height="110" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.5"/>
+    <text x="131" y="78" text-anchor="middle" font-size="13" font-weight="700" fill="#1e293b">Userspace Orchestrator &amp; VMMs</text>
+    <text x="24" y="100" font-size="11.5" fill="#334155">• Opens /dev/liveupdate sessions</text>
+    <text x="24" y="119" font-size="11.5" fill="#334155">• Calls PRESERVE_FD on vmfd,</text>
+    <text x="34" y="135" font-size="11.5" fill="#334155">vcpufd[0..k], cpu&lt;N&gt;/preserve</text>
+    <text x="24" y="153" font-size="11.5" fill="#334155">• Triggers kexec &amp; RETRIEVE_FD</text>
+
+    <!-- Kexec Reboot Transition Box -->
+    <rect x="14" y="182" width="234" height="252" rx="8" fill="#fff1f2" stroke="#f43f5e" stroke-width="1.5" stroke-dasharray="5,3"/>
+    <text x="131" y="206" text-anchor="middle" font-size="13" font-weight="700" fill="#be123c">Linux Kernel Kexec Reboot</text>
+    <rect x="28" y="220" width="206" height="52" rx="6" fill="#ffffff" stroke="#fda4af" stroke-width="1.2"/>
+    <text x="131" y="241" text-anchor="middle" font-size="12.5" font-weight="700" fill="#881337">Outgoing Kernel</text>
+    <text x="131" y="259" text-anchor="middle" font-size="11" fill="#9f1239">swapper_pg_dir (Overwritten)</text>
+
+    <path d="M 131 278 L 131 312" stroke="#e11d48" stroke-width="2.5" marker-end="url(#arrowSlate)"/>
+    <text x="141" y="300" font-size="11" font-weight="700" fill="#be123c">kexec_load / reboot</text>
+
+    <rect x="28" y="320" width="206" height="98" rx="6" fill="#ffffff" stroke="#fda4af" stroke-width="1.2"/>
+    <text x="131" y="340" text-anchor="middle" font-size="12.5" font-weight="700" fill="#881337">Incoming Kernel</text>
+    <text x="38" y="360" font-size="11.2" fill="#881337">1. early_init: FLB .retrieve()</text>
+    <text x="38" y="377" font-size="11.2" fill="#881337">2. Matches hwid &amp; sets</text>
+    <text x="50" y="392" font-size="11.2" fill="#881337">cpu_preserved_mask</text>
+    <text x="38" y="409" font-size="11.2" fill="#881337">3. smp_init() skips preserved</text>
+
+    <!-- KHO Handover Root -->
+    <rect x="14" y="452" width="234" height="126" rx="8" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.5"/>
+    <text x="131" y="475" text-anchor="middle" font-size="13" font-weight="700" fill="#1d4ed8">KHO FDT Root (struct luo_ser)</text>
+    <text x="26" y="497" font-size="11.5" font-family="monospace" fill="#1e3a8a">compatible: "luo-v5"</text>
+    <text x="26" y="517" font-size="11.5" font-family="monospace" fill="#1e3a8a">sessions_pa ──► kho_block</text>
+    <text x="26" y="537" font-size="11.5" font-family="monospace" fill="#1e3a8a">flbs_pa     ──► cpu_flb_v1</text>
+    <text x="26" y="561" font-size="11" fill="#475569">Preserves sessions &amp; FLB across kexec</text>
+
+    <!-- Host Housekeeping pCPU Pool -->
+    <rect x="14" y="730" width="234" height="156" rx="8" fill="#f1f5f9" stroke="#64748b" stroke-width="1.8"/>
+    <text x="131" y="752" text-anchor="middle" font-size="13" font-weight="700" fill="#1e293b">Host Housekeeping pCPU Pool</text>
+    <text x="131" y="770" text-anchor="middle" font-size="11" fill="#475569">(Online in Linux • Executes Kexec)</text>
+
+    <g transform="translate(26, 784)" color="#334155">
+      <rect x="0" y="0" width="98" height="48" rx="6" fill="#ffffff" stroke="#64748b" stroke-width="1.5"/>
+      <use href="#chipIcon" x="8" y="12"/>
+      <text x="38" y="22" font-size="12.5" font-weight="700" fill="#0f172a">pCPU 0</text>
+      <text x="38" y="38" font-size="10.5" fill="#475569">Boot / BSP</text>
+    </g>
+    <g transform="translate(136, 784)" color="#334155">
+      <rect x="0" y="0" width="98" height="48" rx="6" fill="#ffffff" stroke="#64748b" stroke-width="1.5"/>
+      <use href="#chipIcon" x="8" y="12"/>
+      <text x="38" y="22" font-size="12.5" font-weight="700" fill="#0f172a">pCPU 1</text>
+      <text x="38" y="38" font-size="10.5" fill="#475569">Host SMP</text>
+    </g>
+    <text x="131" y="854" text-anchor="middle" font-size="11" font-family="monospace" fill="#475569">CR3 / TTBR1 = swapper_pg_dir</text>
+    <text x="131" y="872" text-anchor="middle" font-size="11" fill="#dc2626" font-weight="600">Unmapped in Preserved AS 1..N</text>
+  </g>
+
+  <!-- ======================================================================= -->
+  <!-- TIER 1: VIRTUAL MACHINES (VM 1, VM 2, ..., VM N)                        -->
+  <!-- ======================================================================= -->
+  <!-- VM 1 Card (Stacked 3D VM Image Effect) -->
+  <g transform="translate(336, 134)">
+    <rect x="8" y="-6" width="435" height="218" rx="10" fill="#dbeafe" stroke="#93c5fd" stroke-width="1"/>
+    <rect x="4" y="-3" width="435" height="218" rx="10" fill="#eff6ff" stroke="#60a5fa" stroke-width="1"/>
+    <rect x="0" y="0" width="435" height="218" rx="10" fill="#ffffff" stroke="#2563eb" stroke-width="2.2" filter="url(#shadow-sm)"/>
+    <rect x="0" y="0" width="435" height="42" rx="10" fill="url(#vmHeaderBlue)"/>
+    <rect x="0" y="24" width="435" height="18" fill="url(#vmHeaderBlue)"/>
+    <use href="#vmIcon" x="16" y="9"/>
+    <text x="56" y="27" font-size="16" font-weight="800" fill="#ffffff">VM 1 Instance</text>
+    <rect x="312" y="9" width="108" height="24" rx="12" fill="#1e3a8a"/>
+    <text x="366" y="25" text-anchor="middle" font-size="11.5" font-weight="700" fill="#bfdbfe">2 vCPUs • 1:1</text>
+
+    <!-- Guest OS + Stage-2 / EPT Scope inside VM 1 -->
+    <rect x="14" y="52" width="407" height="72" rx="7" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+    <text x="26" y="71" font-size="12.5" font-weight="700" fill="#92400e">Guest Physical Memory &amp; Stage-2 / EPT Scope</text>
+    <text x="26" y="90" font-size="11.5" fill="#78350f">• Guest OS Image, Guest RAM &amp; Passthrough / Virtio Queues</text>
+    <text x="26" y="109" font-size="11.2" font-family="monospace" fill="#92400e">vmfd ──► struct kvm_luo_ser { kho_folios (EPT/Stage-2) }</text>
+
+    <!-- Virtual CPU Pool inside VM 1 -->
+    <rect x="14" y="134" width="407" height="72" rx="7" fill="#eff6ff" stroke="#93c5fd" stroke-width="1.5"/>
+    <text x="26" y="152" font-size="12" font-weight="700" fill="#1e3a8a">VM 1 Virtual CPU Pool (Preserved vcpufds)</text>
+    <g transform="translate(26, 160)">
+      <rect x="0" y="0" width="185" height="38" rx="5" fill="#ffffff" stroke="#3b82f6" stroke-width="1.5"/>
+      <text x="92" y="17" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1d4ed8">vCPU 0 (vcpufd)</text>
+      <text x="92" y="32" text-anchor="middle" font-size="10.5" font-family="monospace" fill="#475569">kvm_vcpu_ser • arch_state</text>
+    </g>
+    <g transform="translate(223, 160)">
+      <rect x="0" y="0" width="185" height="38" rx="5" fill="#ffffff" stroke="#3b82f6" stroke-width="1.5"/>
+      <text x="92" y="17" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1d4ed8">vCPU 1 (vcpufd)</text>
+      <text x="92" y="32" text-anchor="middle" font-size="10.5" font-family="monospace" fill="#475569">kvm_vcpu_ser • arch_state</text>
+    </g>
+  </g>
+
+  <!-- VM 2 Card (Stacked 3D VM Image Effect) -->
+  <g transform="translate(796, 134)">
+    <rect x="8" y="-6" width="435" height="218" rx="10" fill="#ccfbf1" stroke="#5eead4" stroke-width="1"/>
+    <rect x="4" y="-3" width="435" height="218" rx="10" fill="#f0fdfa" stroke="#2dd4bf" stroke-width="1"/>
+    <rect x="0" y="0" width="435" height="218" rx="10" fill="#ffffff" stroke="#0d9488" stroke-width="2.2" filter="url(#shadow-sm)"/>
+    <rect x="0" y="0" width="435" height="42" rx="10" fill="url(#vmHeaderTeal)"/>
+    <rect x="0" y="24" width="435" height="18" fill="url(#vmHeaderTeal)"/>
+    <use href="#vmIcon" x="16" y="9"/>
+    <text x="56" y="27" font-size="16" font-weight="800" fill="#ffffff">VM 2 Instance</text>
+    <rect x="290" y="9" width="132" height="24" rx="12" fill="#115e59"/>
+    <text x="356" y="25" text-anchor="middle" font-size="11.5" font-weight="700" fill="#99f6e4">2 vCPUs • 2:1 Shared</text>
+
+    <!-- Guest OS + Stage-2 / EPT Scope inside VM 2 -->
+    <rect x="14" y="52" width="407" height="72" rx="7" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+    <text x="26" y="71" font-size="12.5" font-weight="700" fill="#92400e">Guest Physical Memory &amp; Stage-2 / EPT Scope</text>
+    <text x="26" y="90" font-size="11.5" fill="#78350f">• Guest OS Image, Guest RAM &amp; Passthrough / Virtio Queues</text>
+    <text x="26" y="109" font-size="11.2" font-family="monospace" fill="#92400e">vmfd ──► struct kvm_luo_ser { kho_folios (EPT/Stage-2) }</text>
+
+    <!-- Virtual CPU Pool inside VM 2 -->
+    <rect x="14" y="134" width="407" height="72" rx="7" fill="#f0fdfa" stroke="#5eead4" stroke-width="1.5"/>
+    <text x="26" y="152" font-size="12" font-weight="700" fill="#115e59">VM 2 Virtual CPU Pool (Preserved vcpufds)</text>
+    <g transform="translate(26, 160)">
+      <rect x="0" y="0" width="185" height="38" rx="5" fill="#ffffff" stroke="#0d9488" stroke-width="1.5"/>
+      <text x="92" y="17" text-anchor="middle" font-size="12.5" font-weight="700" fill="#0f766e">vCPU 0 (vcpufd)</text>
+      <text x="92" y="32" text-anchor="middle" font-size="10.5" font-family="monospace" fill="#475569">kvm_vcpu_ser • arch_state</text>
+    </g>
+    <g transform="translate(223, 160)">
+      <rect x="0" y="0" width="185" height="38" rx="5" fill="#ffffff" stroke="#0d9488" stroke-width="1.5"/>
+      <text x="92" y="17" text-anchor="middle" font-size="12.5" font-weight="700" fill="#0f766e">vCPU 1 (vcpufd)</text>
+      <text x="92" y="32" text-anchor="middle" font-size="10.5" font-family="monospace" fill="#475569">kvm_vcpu_ser • arch_state</text>
+    </g>
+  </g>
+
+  <!-- Ellipsis "..." Indicator Between VM 2 and VM N -->
+  <g transform="translate(1248, 225)">
+    <circle cx="12" cy="0" r="4.5" fill="#64748b"/>
+    <circle cx="28" cy="0" r="4.5" fill="#64748b"/>
+    <circle cx="44" cy="0" r="4.5" fill="#64748b"/>
+    <text x="28" y="24" text-anchor="middle" font-size="12" font-weight="700" fill="#475569">1..N VMs</text>
+  </g>
+
+  <!-- VM N Card (Stacked 3D VM Image Effect) -->
+  <g transform="translate(1310, 134)">
+    <rect x="8" y="-6" width="435" height="218" rx="10" fill="#ede9fe" stroke="#c4b5fd" stroke-width="1"/>
+    <rect x="4" y="-3" width="435" height="218" rx="10" fill="#f5f3ff" stroke="#a78bfa" stroke-width="1"/>
+    <rect x="0" y="0" width="435" height="218" rx="10" fill="#ffffff" stroke="#7c3aed" stroke-width="2.2" filter="url(#shadow-sm)"/>
+    <rect x="0" y="0" width="435" height="42" rx="10" fill="url(#vmHeaderPurple)"/>
+    <rect x="0" y="24" width="435" height="18" fill="url(#vmHeaderPurple)"/>
+    <use href="#vmIcon" x="16" y="9"/>
+    <text x="56" y="27" font-size="16" font-weight="800" fill="#ffffff">VM N Instance</text>
+    <rect x="315" y="9" width="104" height="24" rx="12" fill="#4c1d95"/>
+    <text x="367" y="25" text-anchor="middle" font-size="11.5" font-weight="700" fill="#ddd6fe">k vCPUs</text>
+
+    <!-- Guest OS + Stage-2 / EPT Scope inside VM N -->
+    <rect x="14" y="52" width="407" height="72" rx="7" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
+    <text x="26" y="71" font-size="12.5" font-weight="700" fill="#92400e">Guest Physical Memory &amp; Stage-2 / EPT Scope</text>
+    <text x="26" y="90" font-size="11.5" fill="#78350f">• Guest OS Image, Guest RAM &amp; Passthrough / Virtio Queues</text>
+    <text x="26" y="109" font-size="11.2" font-family="monospace" fill="#92400e">vmfd ──► struct kvm_luo_ser { kho_folios (EPT/Stage-2) }</text>
+
+    <!-- Virtual CPU Pool inside VM N -->
+    <rect x="14" y="134" width="407" height="72" rx="7" fill="#f5f3ff" stroke="#c4b5fd" stroke-width="1.5"/>
+    <text x="26" y="152" font-size="12" font-weight="700" fill="#4c1d95">VM N Virtual CPU Pool (vcpufd[0..k])</text>
+    <g transform="translate(26, 160)">
+      <rect x="0" y="0" width="168" height="38" rx="5" fill="#ffffff" stroke="#7c3aed" stroke-width="1.5"/>
+      <text x="84" y="17" text-anchor="middle" font-size="12.5" font-weight="700" fill="#6d28d9">vCPU 0</text>
+      <text x="84" y="32" text-anchor="middle" font-size="10.5" font-family="monospace" fill="#475569">kvm_vcpu_ser</text>
+    </g>
+    <text x="214" y="184" text-anchor="middle" font-size="14" font-weight="800" fill="#6d28d9">•••</text>
+    <g transform="translate(236, 160)">
+      <rect x="0" y="0" width="168" height="38" rx="5" fill="#ffffff" stroke="#7c3aed" stroke-width="1.5"/>
+      <text x="84" y="17" text-anchor="middle" font-size="12.5" font-weight="700" fill="#6d28d9">vCPU k</text>
+      <text x="84" y="32" text-anchor="middle" font-size="10.5" font-family="monospace" fill="#475569">kvm_vcpu_ser</text>
+    </g>
+  </g>
+
+  <!-- Arrows from VMs to LUO Sessions -->
+  <path d="M 553 352 L 553 388" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrowBlue)"/>
+  <text x="563" y="375" font-size="11.5" font-weight="700" fill="#1d4ed8">PRESERVE_FD</text>
+
+  <path d="M 1013 352 L 1013 388" stroke="#0d9488" stroke-width="2.5" marker-end="url(#arrowTeal)"/>
+  <text x="1023" y="375" font-size="11.5" font-weight="700" fill="#0f766e">PRESERVE_FD</text>
+
+  <path d="M 1527 352 L 1527 388" stroke="#7c3aed" stroke-width="2.5" marker-end="url(#arrowPurple)"/>
+  <text x="1537" y="375" font-size="11.5" font-weight="700" fill="#6d28d9">PRESERVE_FD</text>
+
+  <!-- ======================================================================= -->
+  <!-- TIER 2 & 3: LUO SESSIONS + ISOLATED ADDRESS SPACE SCOPE + pCPU POOLS    -->
+  <!-- ======================================================================= -->
+
+  <!-- ================= SESSION 1 + AS 1 + pCPU 2,3 ================= -->
+  <g transform="translate(336, 392)">
+    <rect x="0" y="0" width="435" height="492" rx="12" fill="#ffffff" stroke="#2563eb" stroke-width="2" filter="url(#shadow-sm)"/>
+    <rect x="0" y="0" width="435" height="36" rx="12" fill="#dbeafe"/>
+    <rect x="0" y="20" width="435" height="16" fill="#dbeafe"/>
+    <text x="18" y="24" font-size="14.5" font-weight="800" fill="#1e3a8a">LUO Session 1 ("vm1-session")</text>
+    <text x="418" y="24" text-anchor="end" font-size="11.5" font-family="monospace" font-weight="600" fill="#1d4ed8">luo_session_ser</text>
+
+    <!-- ISOLATED ADDRESS SPACE 1 SCOPE BOUNDARY (Dashed Highlighted Box) -->
+    <rect x="12" y="48" width="411" height="290" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="2.5" stroke-dasharray="7,4"/>
+    <rect x="24" y="38" width="387" height="22" rx="5" fill="#2563eb"/>
+    <text x="217" y="53" text-anchor="middle" font-size="11.5" font-weight="700" fill="#ffffff">ISOLATED ADDRESS SPACE 1 (struct cpu_preserved_as_ser)</text>
+
+    <!-- Page Table Root & kho_block Info -->
+    <rect x="24" y="68" width="387" height="48" rx="6" fill="#ffffff" stroke="#93c5fd" stroke-width="1.5"/>
+    <text x="34" y="87" font-size="11.3" font-family="monospace" font-weight="700" fill="#1e3a8a">pgd_pa • nr_pgtable_pages • pg_tables • direct_map_offset</text>
+    <text x="34" y="105" font-size="11.3" fill="#334155">Maps ONLY Session 1 objects below + Global FLB .cpu_preserved.*</text>
+
+    <!-- On-Core Session 1 & Runqueue inside AS 1 -->
+    <rect x="24" y="124" width="387" height="122" rx="6" fill="#ffffff" stroke="#60a5fa" stroke-width="1.5"/>
+    <text x="34" y="144" font-size="13" font-weight="700" fill="#0f172a">On-Core Session 1 (struct oncore_session)</text>
+    <text x="34" y="162" font-size="11.3" font-family="monospace" fill="#475569">rq (oncore_runqueue) • cps ──► AS 1 • cpus: {pCPU 2, pCPU 3}</text>
+
+    <!-- Runqueue Jobs & Caretaker CBs -->
+    <rect x="34" y="172" width="176" height="62" rx="5" fill="#f8fafc" stroke="#93c5fd" stroke-width="1.2"/>
+    <text x="122" y="190" text-anchor="middle" font-size="12" font-weight="700" fill="#1d4ed8">oncore_job 0 (vCPU 0)</text>
+    <text x="122" y="207" text-anchor="middle" font-size="11" font-family="monospace" fill="#334155">kvm_caretaker_cb_ser</text>
+    <text x="122" y="223" text-anchor="middle" font-size="10.5" fill="#059669" font-weight="600">Assigned: pCPU 2</text>
+
+    <rect x="223" y="172" width="176" height="62" rx="5" fill="#f8fafc" stroke="#93c5fd" stroke-width="1.2"/>
+    <text x="311" y="190" text-anchor="middle" font-size="12" font-weight="700" fill="#1d4ed8">oncore_job 1 (vCPU 1)</text>
+    <text x="311" y="207" text-anchor="middle" font-size="11" font-family="monospace" fill="#334155">kvm_caretaker_cb_ser</text>
+    <text x="311" y="223" text-anchor="middle" font-size="10.5" fill="#059669" font-weight="600">Assigned: pCPU 3</text>
+
+    <!-- Mapped Per-pCPU Stacks & Descriptors inside AS 1 -->
+    <rect x="24" y="254" width="387" height="72" rx="6" fill="#ffffff" stroke="#60a5fa" stroke-width="1.5"/>
+    <text x="34" y="273" font-size="12.2" font-weight="700" fill="#0f172a">Per-CPU Preserved Descriptors &amp; Stacks (Mapped in AS 1)</text>
+    <rect x="34" y="281" width="176" height="36" rx="4" fill="#eff6ff" stroke="#93c5fd" stroke-width="1"/>
+    <text x="122" y="297" text-anchor="middle" font-size="11" font-family="monospace" font-weight="700" fill="#1e3a8a">cpu_preserved_ser[2]</text>
+    <text x="122" y="311" text-anchor="middle" font-size="10.5" font-family="monospace" fill="#475569">stack_pa • hwid • session</text>
+
+    <rect x="223" y="281" width="176" height="36" rx="4" fill="#eff6ff" stroke="#93c5fd" stroke-width="1"/>
+    <text x="311" y="297" text-anchor="middle" font-size="11" font-family="monospace" font-weight="700" fill="#1e3a8a">cpu_preserved_ser[3]</text>
+    <text x="311" y="311" text-anchor="middle" font-size="10.5" font-family="monospace" fill="#475569">stack_pa • hwid • session</text>
+
+    <!-- Session 1 Physical CPU Pool -->
+    <rect x="12" y="352" width="411" height="128" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="1.8"/>
+    <text x="217" y="373" text-anchor="middle" font-size="13" font-weight="800" fill="#1e3a8a">Session 1 Preserved pCPU Pool (cpu_preserved_session)</text>
+
+    <g transform="translate(24, 384)" color="#1d4ed8">
+      <rect x="0" y="0" width="184" height="84" rx="6" fill="#ffffff" stroke="#2563eb" stroke-width="1.6"/>
+      <use href="#chipIcon" x="10" y="10"/>
+      <text x="42" y="24" font-size="13.5" font-weight="800" fill="#0f172a">pCPU 2 (Preserved)</text>
+      <text x="12" y="45" font-size="11" font-family="monospace" fill="#1d4ed8">CR3/TTBR1 = AS 1 pgd_pa</text>
+      <text x="12" y="62" font-size="11" font-family="monospace" fill="#059669">EPT/VTTBR = VM 1 Stage-2</text>
+      <text x="12" y="77" font-size="10.5" fill="#475569">Runs VM 1 vCPU 0 Caretaker</text>
+    </g>
+
+    <g transform="translate(226, 384)" color="#1d4ed8">
+      <rect x="0" y="0" width="184" height="84" rx="6" fill="#ffffff" stroke="#2563eb" stroke-width="1.6"/>
+      <use href="#chipIcon" x="10" y="10"/>
+      <text x="42" y="24" font-size="13.5" font-weight="800" fill="#0f172a">pCPU 3 (Preserved)</text>
+      <text x="12" y="45" font-size="11" font-family="monospace" fill="#1d4ed8">CR3/TTBR1 = AS 1 pgd_pa</text>
+      <text x="12" y="62" font-size="11" font-family="monospace" fill="#059669">EPT/VTTBR = VM 1 Stage-2</text>
+      <text x="12" y="77" font-size="10.5" fill="#475569">Runs VM 1 vCPU 1 Caretaker</text>
+    </g>
+  </g>
+
+  <!-- ================= SESSION 2 + AS 2 + pCPU 4 ================= -->
+  <g transform="translate(796, 392)">
+    <rect x="0" y="0" width="435" height="492" rx="12" fill="#ffffff" stroke="#0d9488" stroke-width="2" filter="url(#shadow-sm)"/>
+    <rect x="0" y="0" width="435" height="36" rx="12" fill="#ccfbf1"/>
+    <rect x="0" y="20" width="435" height="16" fill="#ccfbf1"/>
+    <text x="18" y="24" font-size="14.5" font-weight="800" fill="#115e59">LUO Session 2 ("vm2-session")</text>
+    <text x="418" y="24" text-anchor="end" font-size="11.5" font-family="monospace" font-weight="600" fill="#0f766e">luo_session_ser</text>
+
+    <!-- ISOLATED ADDRESS SPACE 2 SCOPE BOUNDARY (Dashed Highlighted Box) -->
+    <rect x="12" y="48" width="411" height="290" rx="10" fill="#f0fdfa" stroke="#0d9488" stroke-width="2.5" stroke-dasharray="7,4"/>
+    <rect x="24" y="38" width="387" height="22" rx="5" fill="#0d9488"/>
+    <text x="217" y="53" text-anchor="middle" font-size="11.5" font-weight="700" fill="#ffffff">ISOLATED ADDRESS SPACE 2 (struct cpu_preserved_as_ser)</text>
+
+    <!-- Page Table Root & kho_block Info -->
+    <rect x="24" y="68" width="387" height="48" rx="6" fill="#ffffff" stroke="#5eead4" stroke-width="1.5"/>
+    <text x="34" y="87" font-size="11.3" font-family="monospace" font-weight="700" fill="#115e59">pgd_pa • nr_pgtable_pages • pg_tables • direct_map_offset</text>
+    <text x="34" y="105" font-size="11.3" fill="#334155">Maps ONLY Session 2 objects below + Global FLB .cpu_preserved.*</text>
+
+    <!-- On-Core Session 2 & Runqueue inside AS 2 -->
+    <rect x="24" y="124" width="387" height="122" rx="6" fill="#ffffff" stroke="#2dd4bf" stroke-width="1.5"/>
+    <text x="34" y="144" font-size="13" font-weight="700" fill="#0f172a">On-Core Session 2 (struct oncore_session)</text>
+    <text x="34" y="162" font-size="11.3" font-family="monospace" fill="#475569">rq (oncore_runqueue) • cps ──► AS 2 • cpus: {pCPU 4}</text>
+
+    <!-- Runqueue Jobs & Caretaker CBs -->
+    <rect x="34" y="172" width="176" height="62" rx="5" fill="#f8fafc" stroke="#5eead4" stroke-width="1.2"/>
+    <text x="122" y="190" text-anchor="middle" font-size="12" font-weight="700" fill="#0f766e">oncore_job 0 (vCPU 0)</text>
+    <text x="122" y="207" text-anchor="middle" font-size="11" font-family="monospace" fill="#334155">kvm_caretaker_cb_ser</text>
+    <text x="122" y="223" text-anchor="middle" font-size="10.5" fill="#d97706" font-weight="600">Time-sliced on pCPU 4</text>
+
+    <rect x="223" y="172" width="176" height="62" rx="5" fill="#f8fafc" stroke="#5eead4" stroke-width="1.2"/>
+    <text x="311" y="190" text-anchor="middle" font-size="12" font-weight="700" fill="#0f766e">oncore_job 1 (vCPU 1)</text>
+    <text x="311" y="207" text-anchor="middle" font-size="11" font-family="monospace" fill="#334155">kvm_caretaker_cb_ser</text>
+    <text x="311" y="223" text-anchor="middle" font-size="10.5" fill="#d97706" font-weight="600">Time-sliced on pCPU 4</text>
+
+    <!-- Mapped Per-pCPU Stacks & Descriptors inside AS 2 -->
+    <rect x="24" y="254" width="387" height="72" rx="6" fill="#ffffff" stroke="#2dd4bf" stroke-width="1.5"/>
+    <text x="34" y="273" font-size="12.2" font-weight="700" fill="#0f172a">Per-CPU Preserved Descriptor &amp; Stack (Mapped in AS 2)</text>
+    <rect x="34" y="281" width="365" height="36" rx="4" fill="#f0fdfa" stroke="#5eead4" stroke-width="1"/>
+    <text x="217" y="297" text-anchor="middle" font-size="11" font-family="monospace" font-weight="700" fill="#115e59">cpu_preserved_ser[4]</text>
+    <text x="217" y="311" text-anchor="middle" font-size="10.5" font-family="monospace" fill="#475569">stack_pa • hwid • session ──► cpu_preserved_session_ser</text>
+
+    <!-- Session 2 Physical CPU Pool -->
+    <rect x="12" y="352" width="411" height="128" rx="8" fill="#ccfbf1" stroke="#0d9488" stroke-width="1.8"/>
+    <text x="217" y="373" text-anchor="middle" font-size="13" font-weight="800" fill="#115e59">Session 2 Preserved pCPU Pool (cpu_preserved_session)</text>
+
+    <g transform="translate(24, 384)" color="#0f766e">
+      <rect x="0" y="0" width="387" height="84" rx="6" fill="#ffffff" stroke="#0d9488" stroke-width="1.6"/>
+      <use href="#chipIcon" x="14" y="10"/>
+      <text x="46" y="24" font-size="13.5" font-weight="800" fill="#0f172a">pCPU 4 (Preserved • Round-Robin Quantum Scheduler)</text>
+      <text x="16" y="45" font-size="11" font-family="monospace" fill="#0f766e">CR3/TTBR1 = AS 2 pgd_pa  (Session 1 &amp; Host RAM Unmapped)</text>
+      <text x="16" y="62" font-size="11" font-family="monospace" fill="#059669">EPT/VTTBR = VM 2 Stage-2 (kvm_luo_ser.kho_folios)</text>
+      <text x="16" y="77" font-size="10.5" fill="#475569">Multiplexes VM 2 vCPU 0 &amp; vCPU 1 via oncore_sched_cpu_worker()</text>
+    </g>
+  </g>
+
+  <!-- Ellipsis "..." Between Session 2 and Session N -->
+  <g transform="translate(1248, 620)">
+    <circle cx="12" cy="0" r="4.5" fill="#64748b"/>
+    <circle cx="28" cy="0" r="4.5" fill="#64748b"/>
+    <circle cx="44" cy="0" r="4.5" fill="#64748b"/>
+    <text x="28" y="24" text-anchor="middle" font-size="11.5" font-weight="700" fill="#475569">Isolated</text>
+    <text x="28" y="39" text-anchor="middle" font-size="11.5" font-weight="700" fill="#475569">Sessions</text>
+  </g>
+
+  <!-- ================= SESSION N + AS N + pCPU M ================= -->
+  <g transform="translate(1310, 392)">
+    <rect x="0" y="0" width="435" height="492" rx="12" fill="#ffffff" stroke="#7c3aed" stroke-width="2" filter="url(#shadow-sm)"/>
+    <rect x="0" y="0" width="435" height="36" rx="12" fill="#ede9fe"/>
+    <rect x="0" y="20" width="435" height="16" fill="#ede9fe"/>
+    <text x="18" y="24" font-size="14.5" font-weight="800" fill="#4c1d95">LUO Session N ("vmN-session")</text>
+    <text x="418" y="24" text-anchor="end" font-size="11.5" font-family="monospace" font-weight="600" fill="#6d28d9">luo_session_ser</text>
+
+    <!-- ISOLATED ADDRESS SPACE N SCOPE BOUNDARY (Dashed Highlighted Box) -->
+    <rect x="12" y="48" width="411" height="290" rx="10" fill="#f5f3ff" stroke="#7c3aed" stroke-width="2.5" stroke-dasharray="7,4"/>
+    <rect x="24" y="38" width="387" height="22" rx="5" fill="#7c3aed"/>
+    <text x="217" y="53" text-anchor="middle" font-size="11.5" font-weight="700" fill="#ffffff">ISOLATED ADDRESS SPACE N (struct cpu_preserved_as_ser)</text>
+
+    <!-- Page Table Root & kho_block Info -->
+    <rect x="24" y="68" width="387" height="48" rx="6" fill="#ffffff" stroke="#c4b5fd" stroke-width="1.5"/>
+    <text x="34" y="87" font-size="11.3" font-family="monospace" font-weight="700" fill="#4c1d95">pgd_pa • nr_pgtable_pages • pg_tables • direct_map_offset</text>
+    <text x="34" y="105" font-size="11.3" fill="#334155">Maps ONLY Session N objects below + Global FLB .cpu_preserved.*</text>
+
+    <!-- On-Core Session N & Runqueue inside AS N -->
+    <rect x="24" y="124" width="387" height="122" rx="6" fill="#ffffff" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="34" y="144" font-size="13" font-weight="700" fill="#0f172a">On-Core Session N (struct oncore_session)</text>
+    <text x="34" y="162" font-size="11.3" font-family="monospace" fill="#475569">rq (oncore_runqueue) • cps ──► AS N • cpus: {pCPU M..}</text>
+
+    <!-- Runqueue Jobs & Caretaker CBs -->
+    <rect x="34" y="172" width="176" height="62" rx="5" fill="#f8fafc" stroke="#c4b5fd" stroke-width="1.2"/>
+    <text x="122" y="190" text-anchor="middle" font-size="12" font-weight="700" fill="#6d28d9">oncore_job 0..k</text>
+    <text x="122" y="207" text-anchor="middle" font-size="11" font-family="monospace" fill="#334155">kvm_caretaker_cb_ser</text>
+    <text x="122" y="223" text-anchor="middle" font-size="10.5" fill="#6d28d9" font-weight="600">vCPU 0..k Workloads</text>
+
+    <rect x="223" y="172" width="176" height="62" rx="5" fill="#f8fafc" stroke="#c4b5fd" stroke-width="1.2"/>
+    <text x="311" y="190" text-anchor="middle" font-size="12" font-weight="700" fill="#6d28d9">oncore_runqueue</text>
+    <text x="311" y="207" text-anchor="middle" font-size="11" fill="#334155">Workload-Agnostic</text>
+    <text x="311" y="223" text-anchor="middle" font-size="10.5" fill="#475569">Per-Session Scheduler</text>
+
+    <!-- Mapped Per-pCPU Stacks & Descriptors inside AS N -->
+    <rect x="24" y="254" width="387" height="72" rx="6" fill="#ffffff" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="34" y="273" font-size="12.2" font-weight="700" fill="#0f172a">Per-CPU Preserved Descriptors &amp; Stacks (Mapped in AS N)</text>
+    <rect x="34" y="281" width="365" height="36" rx="4" fill="#f5f3ff" stroke="#c4b5fd" stroke-width="1"/>
+    <text x="217" y="297" text-anchor="middle" font-size="11" font-family="monospace" font-weight="700" fill="#4c1d95">cpu_preserved_ser[M..]</text>
+    <text x="217" y="311" text-anchor="middle" font-size="10.5" font-family="monospace" fill="#475569">stack_pa • hwid • session ──► cpu_preserved_session_ser</text>
+
+    <!-- Session N Physical CPU Pool -->
+    <rect x="12" y="352" width="411" height="128" rx="8" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.8"/>
+    <text x="217" y="373" text-anchor="middle" font-size="13" font-weight="800" fill="#4c1d95">Session N Preserved pCPU Pool (cpu_preserved_session)</text>
+
+    <g transform="translate(24, 384)" color="#6d28d9">
+      <rect x="0" y="0" width="387" height="84" rx="6" fill="#ffffff" stroke="#7c3aed" stroke-width="1.6"/>
+      <use href="#chipIcon" x="14" y="10"/>
+      <text x="46" y="24" font-size="13.5" font-weight="800" fill="#0f172a">pCPU M.. (Preserved Pool)</text>
+      <text x="16" y="45" font-size="11" font-family="monospace" fill="#6d28d9">CR3/TTBR1 = AS N pgd_pa</text>
+      <text x="16" y="62" font-size="11" font-family="monospace" fill="#059669">EPT/VTTBR = VM N Stage-2</text>
+      <text x="16" y="77" font-size="10.5" fill="#475569">Executes VM N Caretaker vCPU Jobs</text>
+    </g>
+  </g>
+
+  <!-- ======================================================================= -->
+  <!-- TIER 4: GLOBAL FILE-LIFECYCLE-BOUND STATE (FLB: cpu_preserved_flb)      -->
+  <!-- ======================================================================= -->
+  <g transform="translate(336, 912)">
+    <rect x="0" y="0" width="1409" height="122" rx="12" fill="url(#flbGrad)" stroke="#0f172a" stroke-width="2" filter="url(#shadow-sm)"/>
+    <text x="24" y="28" font-size="15" font-weight="800" fill="#ffffff" letter-spacing="0.4">GLOBAL FILE-LIFECYCLE-BOUND STATE (FLB: "cpu_flb_v1" • struct cpu_preserved_global_ser)</text>
+    <text x="1385" y="28" text-anchor="end" font-size="12" font-weight="600" fill="#93c5fd">Shared Across All Preserved pCPUs &amp; Sessions</text>
+
+    <!-- Box 1: Global Preserved CPU List & Arch Mode -->
+    <rect x="24" y="42" width="425" height="66" rx="8" fill="#0f172a" stroke="#475569" stroke-width="1.5"/>
+    <text x="40" y="64" font-size="13" font-family="monospace" font-weight="700" fill="#38bdf8">cpus (cpu_preserved_ser list) • arch_mode</text>
+    <text x="40" y="83" font-size="11.5" fill="#cbd5e1">• Links all handed-over pCPUs {2, 3, 4, ..., M} via next &amp; hwid</text>
+    <text x="40" y="100" font-size="11.5" fill="#cbd5e1">• Early boot verifies arch_mode &amp; sets cpu_preserved_mask</text>
+
+    <!-- Box 2: Relocated Runtime .cpu_preserved.text -->
+    <rect x="469" y="42" width="448" height="66" rx="8" fill="#0f172a" stroke="#3b82f6" stroke-width="1.5"/>
+    <text x="485" y="64" font-size="13" font-family="monospace" font-weight="700" fill="#60a5fa">text_runtime_pa / size (.cpu_preserved.text • ROX)</text>
+    <text x="485" y="83" font-size="11.5" fill="#cbd5e1">• Relocated outside KHO scratch on 1st preserved CPU</text>
+    <text x="485" y="100" font-size="11.5" fill="#93c5fd">• Mapped into EVERY Session's Isolated AS (AS 1, AS 2, ..., AS N)</text>
+
+    <!-- Box 3: Relocated Runtime .cpu_preserved.data -->
+    <rect x="937" y="42" width="448" height="66" rx="8" fill="#0f172a" stroke="#3b82f6" stroke-width="1.5"/>
+    <text x="953" y="64" font-size="13" font-family="monospace" font-weight="700" fill="#60a5fa">data_runtime_pa / size (.cpu_preserved.data • RO/RW)</text>
+    <text x="953" y="83" font-size="11.5" fill="#cbd5e1">• Preserved .rodata, .ex_table, IDT, &amp; isolated runtime data</text>
+    <text x="953" y="100" font-size="11.5" fill="#93c5fd">• Mapped into EVERY Session's Isolated AS (AS 1, AS 2, ..., AS N)</text>
+  </g>
+
+  <!-- Connectors from Global FLB upward into AS 1, AS 2, AS N -->
+  <path d="M 553 912 L 553 886" stroke="#2563eb" stroke-width="2.2" stroke-dasharray="4,3" marker-end="url(#arrowBlue)"/>
+  <path d="M 1013 912 L 1013 886" stroke="#0d9488" stroke-width="2.2" stroke-dasharray="4,3" marker-end="url(#arrowTeal)"/>
+  <path d="M 1527 912 L 1527 886" stroke="#7c3aed" stroke-width="2.2" stroke-dasharray="4,3" marker-end="url(#arrowPurple)"/>
+
+  <!-- Connector from KHO FDT Root to Sessions and FLB -->
+  <path d="M 310 640 L 333 640" stroke="#3b82f6" stroke-width="2" stroke-dasharray="4,3" marker-end="url(#arrowBlue)"/>
+  <path d="M 282 656 L 282 973 L 333 973" fill="none" stroke="#3b82f6" stroke-width="2" stroke-dasharray="4,3" marker-end="url(#arrowBlue)"/>
+</svg>
