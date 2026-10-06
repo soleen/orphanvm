@@ -226,13 +226,13 @@ KVM and LUO file descriptor preservation ioctls:
    preserved physical CPUs return to the host scheduler so the VMM can resume
    `KVM_RUN`.
 4. **The Kexec Gap**:
-   The host performs a `kexec` reboot. During `liveupdate_reboot()`, LUO invokes
-   `.freeze()` (`luo_freeze()`) across all preserved resources, verifying
-   cross-FD dependencies (`vm_token` for `guest_memfd` and `vcpufd`) and walking
-   and KHO-preserving the VM's quiescent secondary page tables
-   (`kvm_luo_freeze()`). Management CPUs then reboot into the incoming kernel
-   while the preserved physical CPUs (`cpu_is_preserved(cpu)`) continue
-   executing guest vCPUs inside the Caretaker's isolated address space.
+   Userspace can optionally freeze the LUO session early via
+   `LIVEUPDATE_SESSION_FREEZE`, quiescing resources and walking/preserving the
+   secondary page tables ahead of time. During `liveupdate_reboot()`, LUO invokes
+   `.freeze()` (`luo_file_freeze()`) across any remaining unfrozen sessions while
+   skipping sessions already frozen early. Management CPUs then reboot into the
+   incoming kernel while the preserved physical CPUs (`cpu_is_preserved(cpu)`)
+   continue executing guest vCPUs inside the Caretaker's isolated address space.
 5. **Reclamation**:
    Once the incoming kernel boots, the new VMM instance opens the preserved LUO
    session and issues `LIVEUPDATE_SESSION_RETRIEVE_FD` for the
@@ -403,7 +403,7 @@ implement the five `struct liveupdate_file_ops` callbacks:
 | Callback        | Trigger                          | `vmfd` (`kvm_luo_*`)                                              | `vcpufd` (`kvm_vcpu_luo_*`)                                                 |
 | :-------------- | :------------------------------- | :---------------------------------------------------------------- | :-------------------------------------------------------------------------- |
 | `.preserve()`   | `LIVEUPDATE_SESSION_PRESERVE_FD` | Allocates `kvm_luo_ser` and records `KVM_CREATE_VM` `type`        | Completes pending I/O, serializes `kvm_vcpu_arch_ser`, hands off to Caretaker |
-| `.freeze()`     | `reboot(LINUX_REBOOT_CMD_KEXEC)` | Walks quiescent secondary page tables and preserves folios in KHO | Resolves parent `ser->vm_token` via `liveupdate_get_token_outgoing()`       |
+| `.freeze()`     | `LIVEUPDATE_SESSION_FREEZE` / `reboot(LINUX_REBOOT_CMD_KEXEC)` | Walks quiescent secondary page tables and preserves folios in KHO | Resolves parent `ser->vm_token` via `liveupdate_get_token_outgoing()`       |
 | `.unpreserve()` | `close(session_fd)` pre-`kexec`  | Unpreserves secondary page tables (if frozen) and frees `ser`     | Detaches from Caretaker, restores state to outgoing `kvm_vcpu`, frees `ser` |
 | `.retrieve()`   | `LIVEUPDATE_SESSION_RETRIEVE_FD` | Creates new `struct kvm`; keeps old page tables until `.finish()` | Stops Caretaker vCPU, creates new `kvm_vcpu`, and restores `arch_state`     |
 | `.finish()`     | `LIVEUPDATE_SESSION_FINISH`      | Restores and frees outgoing secondary page table folios and `ser` | Stops Caretaker (if unretrieved) and frees all KHO vCPU buffers             |
@@ -467,23 +467,35 @@ following lifecycle across `kexec`:
    (`cpuhp_ap_report_dead()` -> `cpu_preserved_report_dead()`), instead of
    entering a platform sleep state (`play_dead()` / ACPI / PSCI), the core
    switches to its preserved stack and isolated page tables and enters
-   `cpu_preserved_park_loop()`.
+   `cpu_preserved_park_loop()`. CPU 0, which runs the `kexec`, cannot be
+   preserved (`-EINVAL`).
 2. **(Optional) Pre-`kexec` Cancellation (`Preserved -> Offline -> Online`)**:
    If the LUO session is closed before `kexec`, `.unpreserve()` aborts the
    preservation and returns the core to the outgoing kernel using the same
    reclamation sequence as step 4.
 3. **Surviving `kexec` (`cpu_is_preserved(cpu)`)**:
-   Because the core is offline and marked `cpu_is_preserved(cpu)`, the outgoing
-   kernel's `kexec` shutdown path skips sending stop IPIs to it (`cpus_stop_mask`
-   only includes online CPUs). During early boot of the incoming kernel,
+   When LUO freezes a CPU file (`.freeze()`), its `struct cpu_preserved_ser`
+   is prepended to the FLB list of handed-over CPUs in $O(1)$ (each CPU records
+   the link that points to it, so `.unfreeze()` unlinks it in $O(1)$ too).
+   Freezing fails with `-EBUSY` unless `reboot_cpu == 0` and CPU 0 is online:
+   the `kexec` then runs on CPU 0, the incoming kernel boots on the same CPU,
+   and both kernels number the CPUs the same way. The reboot notifier stops
+   every preserved CPU that is not on the list. Because the core is offline
+   and marked `cpu_is_preserved(cpu)`, the outgoing kernel's `kexec` shutdown
+   path skips sending stop IPIs to it (`cpus_stop_mask` only includes online
+   CPUs). During early boot of the incoming kernel,
    `cpu_preserve_early_init()` (`early_initcall`) retrieves the global FLB,
    verifies that the incoming kernel's architectural mode matches the outgoing
-   kernel's `arch_mode`, resolves each preserved CPU's hardware ID (`ser->hwid`
-   via `arch_match_cpu_phys_id()`) to its logical CPU ID in the incoming kernel,
-   and sets `cpu_preserved_mask`. When `smp_init()` runs, `_cpu_up()` returns
-   `-EBUSY` for any CPU where `cpu_is_preserved(cpu)` is true (and
-   `cpuhp_smt_enable()` skips it), preventing SMP bringup from resetting the
-   core (`INIT`/`SIPI` on x86, PSCI `CPU_ON` on ARM64).
+   kernel's `arch_mode`, checks in $O(1)$ per entry that the CPU with the
+   entry's logical number (`ser->cpu`) has the entry's hardware ID
+   (`ser->hwid`, via `arch_match_cpu_phys_id()`), and sets
+   `cpu_preserved_mask`. A mismatch is never remapped: the kernel reports it
+   (`pr_err()` and `WARN_ON_ONCE()`), refuses the whole handover, and stops
+   every listed CPU, found by hardware ID, before `smp_init()`. When
+   `smp_init()` runs, `_cpu_up()` returns `-EBUSY` for any CPU where
+   `cpu_is_preserved(cpu)` is true (and `cpuhp_smt_enable()` skips it),
+   preventing SMP bringup from resetting the core (`INIT`/`SIPI` on x86, PSCI
+   `CPU_ON` on ARM64).
 4. **Returning to the Host (`Preserved -> Offline -> Online`)**:
    On `LIVEUPDATE_SESSION_FINISH` in the incoming kernel (or pre-`kexec`
    cancellation), the host detaches any running workload, sets
@@ -555,12 +567,35 @@ Each session's isolated page tables map **only**:
 - `.cpu_preserved.data` and `.cpu_preserved.bss` (`PAGE_KERNEL`)
 - The per-CPU `struct cpu_preserved_ser` descriptors and preserved stacks of
   CPUs belonging to that session
-- Explicitly mapped workload buffers registered into the session's address space
-  via `oncore_session_map_range()` (`cpu_preserved_as_map()`)
+- Workload memory allocated from the session's address space with
+  `oncore_session_alloc_buffer()` (`cpu_preserved_as_alloc_buffer()`), such as
+  `struct oncore_session`, `struct oncore_job`, Caretaker vCPU state, and
+  telemetry, mapped at its direct-map address
+- Pages of another owner that must keep their physical address, adopted with
+  `oncore_session_adopt_page()` (`cpu_preserved_as_adopt_page()`), such as the
+  KVM x86 virtual-APIC page
+- Device registers mapped with `oncore_session_map_mmio()`
+  (`cpu_preserved_as_map_mmio()`), such as the ARM64 GIC redistributors
 
 No other host kernel memory (neither the linear direct map `PAGE_OFFSET`, nor
 `vmalloc`, nor normal `.text`/`.data`, nor other sessions' stacks or buffers) is
 mapped in the session's isolated page tables.
+
+**The address space owns everything it maps**, except the global preserved
+runtime text and data. Every page-table page, stack, descriptor, workload
+buffer, and adopted page is KHO-preserved and recorded in the address space's
+`kho_block_set` (`cpu_preserved_as_ser.folios`), and is freed only with the
+address space, once every CPU of the session has left it:
+`cpu_preserved_as_unpreserve()` in the outgoing kernel (cancellation) and
+`cpu_preserved_as_restore_free()` in the incoming kernel (session finish).
+Nothing mapped is ever freed on its own, so no mapping is ever removed, no page
+table is walked to unmap, and no TLB is flushed. An adopted page stays with its
+owner (for example, `kvm_free_lapic()` drops KVM's reference), while the address
+space holds its own page reference and KHO preservation until teardown. In the
+incoming kernel, only the session's CPUs hold it; since LUO finishes the files
+of a session in reverse order of preservation, a workload file preserved after
+the session's first CPU file (such as a Caretaker vCPU) can still read memory of
+the address space in its `.finish()`.
 
 To avoid relying on host per-CPU offset registers (`%gs` on x86 or
 `TPIDR_EL1`/`TPIDR_EL2` on ARM64) or global per-CPU arrays, per-CPU execution
@@ -636,83 +671,73 @@ struct cpu_preserved_stack_context {
 
 ### 4.4 Preserved Physical CPUs Serialization ABIs
 
-Physical CPU preservation state is handed over across `kexec` using four KHO
+Physical CPU preservation state is handed over across `kexec` using three KHO
 ABI structures defined in `include/linux/kho/abi/cpu.h`:
 
 1. **Per-CPU State (`struct cpu_preserved_ser`)**:
    Serialized when `/sys/devices/system/cpu/cpu<N>/preserve` is preserved via
-   `LIVEUPDATE_SESSION_PRESERVE_FD`:
+   `LIVEUPDATE_SESSION_PRESERVE_FD`, and allocated from the session's isolated
+   address space, in which it is mapped:
 
    ```c
    struct cpu_preserved_ser {
            u32 cpu;
            u32 state;
            u64 stack_pa;
-           DECLARE_KHOSER_PTR(session, struct cpu_preserved_session_ser *);
+           DECLARE_KHOSER_PTR(as, struct cpu_preserved_as_ser *);
            u64 hwid;
            DECLARE_KHOSER_PTR(next, struct cpu_preserved_ser *);
    };
    ```
 
-   - `cpu`: Logical CPU identifier of the preserved physical CPU (updated in the
-     incoming kernel during early boot by matching `hwid`).
+   - `cpu`: Logical CPU number of the preserved physical CPU, the same in both
+     kernels because the outgoing kernel runs the `kexec` on CPU 0 (see §4.1).
    - `state`: Per-CPU execution state (`CPU_PRESERVED_PARKING`,
      `CPU_PRESERVED_PARKED`, `CPU_PRESERVED_EXITING`, `CPU_PRESERVED_DEAD`,
      `CPU_PRESERVED_FAULTED`, `CPU_PRESERVED_WORKLOAD`,
      `CPU_PRESERVED_DETACHING`), shared between the preserved CPU and the host
      kernel.
    - `stack_pa`: Physical address of the KHO-preserved stack allocation for this
-     CPU's isolated execution context (freed during `.finish()`).
-   - `session`: KHO pointer to the per-session preservation descriptor
-     (`struct cpu_preserved_session_ser`).
-   - `hwid`: Hardware CPU identifier (`APIC ID` on x86, `MPIDR_EL1` affinity bits
-     on ARM64) used by the incoming kernel to match the physical core even if
-     logical CPU numbering changes across `kexec`.
-   - `next`: Intrusive KHO pointer linking all preserved CPUs across sessions
-     into the global FLB list (`cpu_preserved_global_ser.cpus`).
-
-2. **Per-Session State (`struct cpu_preserved_session_ser`)**:
-   Shared by all preserved CPUs belonging to the same LUO session:
-
-   ```c
-   struct cpu_preserved_session_ser {
-           DECLARE_KHOSER_PTR(as, struct cpu_preserved_as_ser *);
-           u64 workload_pa;
-   };
-   ```
-
+     CPU's isolated execution context, owned by the session's address space
+     and freed with it.
    - `as`: KHO pointer to the isolated address space metadata
-     (`struct cpu_preserved_as_ser`) for this session.
-   - `workload_pa`: Physical address of the session's workload metadata (for
-     `oncore`, the head PA of its `kho_block_set` tracking preserved session and
-     job pages so the incoming kernel can free them on session release).
+     (`struct cpu_preserved_as_ser`) of the CPU's session. The incoming kernel
+     regroups handed-over CPUs into sessions by this pointer.
+   - `hwid`: Hardware CPU identifier (`APIC ID` on x86, `MPIDR_EL1` affinity bits
+     on ARM64). The incoming kernel checks in $O(1)$ that CPU `cpu` has this
+     identifier and refuses the whole handover otherwise; it never looks for
+     the CPU under another number.
+   - `next`: Intrusive KHO pointer linking the CPUs whose files LUO froze, across
+     sessions, into the global FLB list (`cpu_preserved_global_ser.cpus`). A CPU
+     joins the list in $O(1)$ when its file is frozen and leaves it in $O(1)$
+     when the file is unfrozen.
 
-3. **Isolated Address Space Metadata (`struct cpu_preserved_as_ser`)**:
-   Referenced via `cpu_preserved_session_ser.as`, this structure records the
-   session's isolated page-table root and page-table block chain so the outgoing
-   kernel can unpreserve them on cancellation (`cpu_preserved_as_unpreserve()`)
-   and the incoming kernel can unmap and free them during `.finish()`
-   (`cpu_preserved_as_restore_free()`):
+2. **Isolated Address Space Metadata (`struct cpu_preserved_as_ser`)**:
+   Referenced via `cpu_preserved_ser.as`, this structure records the
+   session's isolated page-table root and `kho_block_set` chain of all
+   KHO-preserved folios owned by the isolated address space so the outgoing
+   kernel can unpreserve and free them in a single place on cancellation
+   (`cpu_preserved_as_unpreserve()`) and the incoming kernel can restore and
+   free them during `.finish()` (`cpu_preserved_as_restore_free()`):
 
    ```c
    struct cpu_preserved_as_ser {
            u64 pgd_pa;
-           u64 nr_pgtable_pages;
-           DECLARE_KHOSER_PTR(pg_tables, struct kho_block_header_ser *);
-           u64 direct_map_offset;
+           u64 nr_folios;
+           DECLARE_KHOSER_PTR(folios, struct kho_block_header_ser *);
    };
    ```
 
    - `pgd_pa`: Physical address of the root page-table page (`CR3` / `TTBR`).
-   - `nr_pgtable_pages` and `pg_tables`: Total page-table page count and KHO
-     pointer to the `kho_block_set` chain recording all page-table pages
-     allocated for the isolated address space without a fixed upper bound.
-   - `direct_map_offset`: The outgoing kernel's `PAGE_OFFSET`, allowing the
-     incoming kernel (which may boot with a different KASLR direct-map offset)
-     to compute the outgoing direct-map virtual addresses when tearing down
-     mappings.
+   - `nr_folios` and `folios`: Total KHO-preserved folio count and KHO pointer
+     to the `kho_block_set` chain recording, without a fixed upper bound,
+     every folio the isolated address space owns: its page-table pages, the
+     stacks and `struct cpu_preserved_ser` descriptors of its CPUs, workload
+     buffers allocated with `cpu_preserved_as_alloc_buffer()` (such as
+     `struct oncore_session`, `struct oncore_job`, and Caretaker vCPU state),
+     and pages adopted with `cpu_preserved_as_adopt_page()`.
 
-4. **Global FLB State (`struct cpu_preserved_global_ser`)**:
+3. **Global FLB State (`struct cpu_preserved_global_ser`)**:
    Preserved once across all sessions via a LUO FLB object
    (`"cpu-preserve-global-v1"`) so the incoming kernel can discover preserved
    CPUs during early boot before any session fd is retrieved:
@@ -732,9 +757,10 @@ ABI structures defined in `include/linux/kho/abi/cpu.h`:
      `data_runtime_size`: Physical address and byte size of the relocated
      `.cpu_preserved.text` and `.cpu_preserved.data` buffers so the incoming
      kernel can free them once all preserved CPUs finish.
-   - `cpus`: Head of the singly linked list of preserved CPUs
-     (`cpu_preserved_ser.next`), walked by `cpu_preserve_early_init()` during
-     early boot.
+   - `cpus`: Head of the singly linked list (`cpu_preserved_ser.next`) of the
+     CPUs whose files LUO froze, built in $O(1)$ per CPU during freeze and
+     walked once by the FLB retrieve that `cpu_preserve_early_init()` triggers
+     during early boot.
    - `arch_mode`: Architectural execution mode snapshot
      (`arch_cpu_preserved_mode()`: x2APIC and 5-level paging `LA57` on x86;
      `PAGE_SHIFT`, `VA_BITS`, `PGTABLE_LEVELS`, `LPA2`, `VHE`, and endianness on
@@ -753,44 +779,49 @@ higher-level workloads such as KVM.
 
 - **`struct oncore_session` and `struct oncore_runqueue`**: Bound 1:1 to a
   `struct liveupdate_session` (`kernel/liveupdate/oncore_internal.h`).
-  `struct oncore_session` tracks the `cpumask` of physical CPUs preserved in
-  that session, embeds a shared `struct oncore_runqueue`, and records all
-  KHO-preserved session and job page allocations in a `struct kho_block_set`:
+  `struct oncore_session` is allocated from the session's isolated address space
+  via `cpu_preserved_as_alloc_buffer()` (which records the folio in
+  `struct cpu_preserved_as_ser`'s `kho_block_set` and maps it into the isolated
+  page tables), and embeds a shared `struct oncore_runqueue`:
 
   ```c
   struct oncore_runqueue {
-          arch_spinlock_t lock;
+          atomic_t lock;
           struct list_head runnable;
-          u32 nr_runnable;
-          u32 nr_active_jobs;
+          unsigned int nr_runnable;
+          unsigned int nr_busy;
   };
 
   struct oncore_session {
-          struct list_head node;
-          char session_name[LIVEUPDATE_SESSION_NAME_LENGTH];
-          cpumask_t cpus;
-          cpumask_t attached_cpus;
-          struct oncore_runqueue rq;
-          struct list_head jobs;
           struct mutex lock;
-          struct kho_block_set block_set;
-          u64 sess_pa;
+          struct list_head jobs;
+          struct oncore_runqueue rq;
+          struct oncore_sched_config sched_config;
+          struct cpu_preserved_session *cps;
+          bool workers_attached;
   };
   ```
 
-  - `cpus` and `attached_cpus`: Bitmasks of physical CPUs preserved in the
-    session and those currently attached to `oncore_sched_cpu_worker()`.
-  - `rq`: Shared FIFO runqueue protected by a raw `arch_spinlock_t` so
-    preserved CPUs can synchronize across `kexec` without host lockdep or
+  - `cps` and `workers_attached`: Handle to the underlying
+    `struct cpu_preserved_session` (which provides the isolated address space
+    and preserved CPU pool) and whether `oncore_sched_cpu_worker()` has been
+    attached to the session's preserved CPUs via
+    `cpu_preserved_session_set_workload()`.
+  - `rq`: Shared FIFO runqueue protected by a raw `cmpxchg()` lock (`rq.lock`)
+    so preserved CPUs can synchronize across `kexec` without host lockdep or
     preemption dependencies.
-  - `block_set`: Tracks the physical addresses of the KHO-preserved
-    `struct oncore_session` and all `struct oncore_job` pages. Its head
-    physical address (`block_set.head_pa`) is stored in
-    `cpu_preserved_session_ser.workload_pa` via
-    `cpu_preserved_session_set_workload()`. On session completion in the
-    incoming kernel (`oncore_session_release()`), `oncore` restores the
-    `kho_block_set` and frees all preserved session and job pages without
-    interpreting the outgoing kernel's `struct oncore_session` layout.
+  - **Unified KHO Folio Teardown**: `struct oncore_session`, every
+    `struct oncore_job`, and every job's `data` buffer (which must come from
+    `oncore_session_alloc_buffer()`) are allocated via
+    `cpu_preserved_as_alloc_buffer()` and recorded directly in the isolated
+    address space's `kho_block_set` (`cpu_preserved_as_ser.folios`). Neither
+    `oncore_session_cancel_job()` nor `oncore_session_destroy()` frees those
+    folios early; instead, all session, job, workload, and isolated page-table
+    folios are unpreserved/restored and freed together in a single place when
+    the address space is removed (`cpu_preserved_as_unpreserve()` on outgoing
+    cancellation or `cpu_preserved_as_restore_free()` on incoming session
+    finish) without the incoming kernel ever interpreting
+    `struct oncore_session` or `struct oncore_job`.
 - **`struct oncore_job`**: Represents an independent unit of work (such as a
   single preserved KVM vCPU) submitted to an `oncore_session` via
   `oncore_session_submit_job()`:
@@ -799,12 +830,13 @@ higher-level workloads such as KVM.
   struct oncore_job {
           struct list_head node;
           struct list_head sess_node;
-          struct oncore_session *sess;
+          struct oncore_session *session;
+          enum oncore_job_state state;
           oncore_job_fn run_fn;
           void *data;
-          enum oncore_job_state state;
           int assigned_cpu;
-          u64 job_pa;
+          int last_cpu;
+          u64 total_runs;
   };
   ```
 
@@ -871,10 +903,12 @@ preserved into a LUO session:
 1. **Job Creation**: `kvm_caretaker_vcpu_pre_preserve()` allocates a
    `struct oncore_job` on the session for `kvm_arch_vcpu_caretaker_run()`.
 2. **State and Runtime Initialization**: `kvm_arch_vcpu_luo_preserve()`
-   serializes architectural state into `struct kvm_vcpu_arch_ser`, initializes
-   the Caretaker runtime page in `KVM_CARETAKER_PAUSED` (`ser->cb`), and maps
-   both into the session's isolated address space
-   (`struct cpu_preserved_as_ser`).
+   serializes architectural state into `struct kvm_vcpu_arch_ser` and
+   initializes the Caretaker runtime page in `KVM_CARETAKER_PAUSED`
+   (`ser->cb`). Both are allocated from the session's isolated address space
+   (`kvm_caretaker_alloc_arch_state()` and `oncore_session_alloc_buffer()`), so
+   they are mapped there and owned by it (`struct cpu_preserved_as_ser`): KVM
+   never frees them, and they are freed with the address space.
 3. **Activation**: `kvm_caretaker_vcpu_post_preserve()` activates the job on the
    `oncore` runqueue (`oncore_session_activate_job()`), waking an idle preserved
    CPU to resume the vCPU immediately (or queuing it until a preserved CPU in
@@ -912,10 +946,18 @@ points to a KHO-preserved Caretaker control block defined in
      struct kvm_caretaker_arch_ser {
              struct kvm_caretaker_cb_ser cb;
              u32 nr_preserved_pages;
+             u32 reserved;
              u64 pi_desc_pa;
              u64 preserved_pages_pa[KVM_X86_CARETAKER_MAX_PAGES];
-     };
+     } __packed;
      ```
+
+     `preserved_pages_pa` (up to `KVM_X86_CARETAKER_MAX_PAGES` = 4) lists the
+     per-vCPU hardware control pages that the hardware uses by physical address
+     and that are not mapped into the session's address space: the VMCS, MSR
+     bitmap, PML, and #VE information pages. The virtual-APIC page, which the
+     Caretaker reads and writes, is adopted into the session's address space
+     instead (see §6.3).
 
    - **ARM64 (`include/linux/kho/abi/kvm_arm64.h`)**:
 
@@ -1009,13 +1051,19 @@ to return the vCPU to host KVM:
   If the LUO session is closed before `kexec`, the outgoing kernel transitions
   `cb->state` to `KVM_CARETAKER_STOPPED`, restores the updated `ser->arch_state`
   and hardware control state back into the existing `struct kvm_vcpu`, cancels
-  the `oncore` job, and frees the Caretaker pages so the VMM can immediately
-  resume `KVM_RUN`.
+  the `oncore` job, and unpreserves the hardware control pages
+  (`preserved_pages_pa`) so the VMM can immediately resume `KVM_RUN`. The
+  Caretaker page, `ser->arch_state`, and telemetry belong to the session's
+  address space and are freed with it, after the session's CPUs have left it.
 - **Incoming Reclamation (`kvm_vcpu_luo_retrieve()`, `kvm_vcpu_luo_finish()`)**:
   In the new kernel, retrieving each `vcpufd` transitions `cb->state` to
   `KVM_CARETAKER_STOPPED` and restores `ser->arch_state` and hardware control
   state into the new `struct kvm_vcpu`, and `.finish()` stops any unretrieved
-  Caretaker vCPUs and frees the preserved Caretaker and telemetry pages.
+  Caretaker vCPUs and frees the restored hardware control pages. The Caretaker
+  page, `ser->arch_state`, telemetry, and (on x86) the adopted virtual-APIC
+  page are freed with the session's address space when its last CPU file is
+  finished; LUO finishes a `vcpufd` before the CPU files preserved ahead of it,
+  so that memory is still valid during the vCPU's `.finish()`.
 
 ### 6.3 KVM Caretaker Arch Backends
 
@@ -1035,7 +1083,10 @@ inside the Caretaker's preserved runtime page:
 - **x86 Common**:
   Sets up standalone per-CPU GDT, TSS, and IST stacks (`struct x86_preserved_cpu`)
   and `x86_preserved_idt` so host-mode exceptions and interrupts land in
-  self-contained handlers, preserves the virtual-APIC (`apic->regs`) page, and
+  self-contained handlers, adopts the virtual-APIC (`apic->regs`) page into the
+  session's address space with `oncore_session_adopt_page()` (KVM keeps owning
+  it and APICv/AVIC keep using its physical address, while the address space
+  holds a reference and its KHO preservation until teardown), and
   saves/restores guest FPU (`XRSTOR64` / `XSAVE64` on `state->xsave.region`),
   `XCR0`, `PKRU`, and `DEBUGCTL` in place.
 - **Intel VMX**:
@@ -1060,7 +1111,13 @@ inside the Caretaker's preserved runtime page:
   context-switches EL1 system registers, FP/SIMD/SVE, Stage-2 MMU (`VTCR_EL2`,
   `VTTBR_EL2`), VGICv3 CPU interface registers, and the virtual timer via shared
   `hyp/switch.h` helpers, and uses the EL2 physical timer (`CNTHP_CVAL_EL2`) for
-  quantum deadlines.
+  quantum deadlines. The VM-wide `struct kvm` copy shared by a VM's Caretaker
+  vCPUs is allocated from the address space of the session of its first
+  Caretaker vCPU, and the vCPUs follow each other's Caretaker pages for SGI
+  injection, so all Caretaker vCPUs of a VM must belong to that one session:
+  preserving a vCPU into another session fails with `-EBUSY` (checked by
+  session ID under a dedicated mutex). The VMID is unpinned with the VM's last
+  Caretaker vCPU; the memory is freed with the address space.
 
 ### 6.4 Implemented VM-Exits
 
@@ -1222,16 +1279,19 @@ Caretaker through a unified build and data-structure model across all
 ### 7.2 Bare-Metal Platform Considerations
 
 1. **CPU Enumeration, Hardware IDs, and Architectural Mode Verification**:
-   To harden against logical CPU renumbering or incompatible kernel
-   configurations across `kexec`, `cpu_preserve` records each preserved CPU's
-   hardware identifier (`ser->hwid` via `arch_cpu_preserved_hwid()`: `APIC ID`
-   on x86, `MPIDR_EL1` affinity bits on ARM64) and the outgoing kernel's
-   architectural execution mode (`global_ser->arch_mode` via
-   `arch_cpu_preserved_mode()`). During early boot of the incoming kernel
-   (`cpu_preserve_early_init()`), `cpu_preserve` verifies `arch_mode`
-   compatibility and matches each preserved CPU's `ser->hwid` against the
-   incoming kernel's present CPUs via `arch_match_cpu_phys_id()`, updating
-   `ser->cpu` if logical CPU numbering changed.
+   To detect logical CPU renumbering or incompatible kernel configurations
+   across `kexec`, `cpu_preserve` records each preserved CPU's hardware
+   identifier (`ser->hwid` via `arch_cpu_preserved_hwid()`: `APIC ID` on x86,
+   `MPIDR_EL1` affinity bits on ARM64) and the outgoing kernel's architectural
+   execution mode (`global_ser->arch_mode` via `arch_cpu_preserved_mode()`).
+   Logical numbers are kept stable by running the `kexec` on CPU 0, which
+   cannot be preserved (freezing a CPU file fails otherwise). During early boot
+   of the incoming kernel (`cpu_preserve_early_init()`), `cpu_preserve` verifies
+   `arch_mode` compatibility and checks in $O(1)$ that CPU `ser->cpu` has
+   hardware identifier `ser->hwid` (`arch_match_cpu_phys_id()`). On a mismatch
+   it reports the error loudly (`pr_err()` and `WARN_ON_ONCE()`) and refuses the
+   whole handover, stopping the listed CPUs by hardware identifier; it never
+   looks for the CPU under another number.
 2. **Platform Events (SMIs, MCEs, and SErrors)**:
    Preserved CPUs avoid deep C-states (`PAUSE` / `WFE`) and install standalone
    exception vectors (`x86_preserved_idt` with dedicated per-CPU IST stacks for
