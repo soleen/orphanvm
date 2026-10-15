@@ -92,6 +92,8 @@ CONFIG_EXT4_FS=y
 CONFIG_TMPFS=y
 CONFIG_TMPFS_POSIX_ACL=y
 CONFIG_HUGETLBFS=y
+CONFIG_TRANSPARENT_HUGEPAGE=y
+CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS=y
 
 # /dev/mem physical access (required for ovm_monitor & live update telemetry)
 CONFIG_DEVMEM=y
